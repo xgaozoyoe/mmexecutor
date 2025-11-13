@@ -28,6 +28,7 @@ struct TickerPrice {
 
 #[derive(Debug, Serialize)]
 pub struct BatchOrderItem {
+    pub symbol: String,
     pub side: String,
     #[serde(rename = "type")]
     pub order_type: String,
@@ -163,7 +164,8 @@ impl Exchange for MexcExchange {
         let batch_orders: Vec<BatchOrderItem> = orders
             .iter()
             .map(|order| BatchOrderItem {
-                side: order.side.clone(),
+                symbol: order.symbol.clone(),
+                side: order.side.to_uppercase(),
                 order_type: "LIMIT".to_string(),
                 quantity: order.quantity.to_string(),
                 price: order.price.to_string(),
@@ -173,8 +175,7 @@ impl Exchange for MexcExchange {
 
         let batch_orders_json = serde_json::to_string(&batch_orders)?;
 
-        let query_string = format!("symbol={}&batchOrders={}&timestamp={}",
-            symbol,
+        let query_string = format!("batchOrders={}&timestamp={}",
             urlencoding::encode(&batch_orders_json),
             timestamp
         );
@@ -196,6 +197,7 @@ impl Exchange for MexcExchange {
         }
 
         let response_text = response.text().await?;
+
         let responses: Vec<OrderResponse> = serde_json::from_str(&response_text)
             .context(format!("Failed to parse batch order response. Raw response: {}", response_text))?;
 

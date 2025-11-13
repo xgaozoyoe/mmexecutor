@@ -1,0 +1,361 @@
+.App {
+  min-height: 100vh;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  padding: 20px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+}
+
+.App-header {
+  text-align: center;
+  color: white;
+  margin-bottom: 30px;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 30px;
+  border-radius: 15px;
+  box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+  backdrop-filter: blur(4px);
+}
+
+.App-header h1 {
+  margin: 0 0 15px 0;
+  font-size: 2.5em;
+  text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.last-update {
+  font-size: 0.9em;
+  opacity: 0.9;
+}
+
+.loading-indicator {
+  animation: spin 1s linear infinite;
+  display: inline-block;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading,
+.error {
+  text-align: center;
+  padding: 50px;
+  font-size: 1.5em;
+  color: white;
+}
+
+.exchange-section {
+  background: white;
+  border-radius: 15px;
+  padding: 25px;
+  margin-bottom: 30px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+}
+
+.exchange-name {
+  color: #667eea;
+  border-bottom: 3px solid #667eea;
+  padding-bottom: 10px;
+  margin-bottom: 25px;
+  font-size: 1.8em;
+}
+
+.card {
+  background: #f8f9fa;
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 20px;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.card h3 {
+  color: #333;
+  margin-top: 0;
+  margin-bottom: 15px;
+  font-size: 1.3em;
+  display: flex;
+  align-items: center;
+}
+
+.balance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 15px;
+}
+
+.balance-item {
+  background: white;
+  padding: 15px;
+  border-radius: 8px;
+  border-left: 4px solid #667eea;
+}
+
+.balance-asset {
+  font-size: 1.2em;
+  font-weight: bold;
+  color: #667eea;
+  margin-bottom: 10px;
+}
+
+.balance-details div {
+  padding: 5px 0;
+  color: #555;
+}
+
+.market-price {
+  display: flex;
+  justify-content: space-around;
+  margin-bottom: 20px;
+  padding: 15px;
+  background: white;
+  border-radius: 8px;
+}
+
+.market-price div {
+  color: #555;
+}
+
+.depth-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: white;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.depth-table th {
+  background: #667eea;
+  color: white;
+  padding: 12px;
+  text-align: left;
+}
+
+.depth-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #eee;
+  color: #555;
+}
+
+.depth-table tr:hover {
+  background: #f5f5f5;
+}
+
+.order-summary {
+  margin-bottom: 15px;
+  padding: 10px;
+  background: white;
+  border-radius: 8px;
+  font-size: 1.1em;
+  color: #555;
+}
+
+.order-sides {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 15px;
+  margin-bottom: 15px;
+}
+
+.order-side {
+  padding: 15px;
+  border-radius: 8px;
+}
+
+.order-side.buy {
+  background: linear-gradient(135deg, #d4fc79 0%, #96e6a1 100%);
+}
+
+.order-side.sell {
+  background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+}
+
+.order-side h4 {
+  margin-top: 0;
+  margin-bottom: 12px;
+  font-size: 1.2em;
+}
+
+.order-side div {
+  padding: 5px 0;
+  color: #333;
+}
+
+.total-unfilled {
+  padding: 15px;
+  background: white;
+  border-radius: 8px;
+  text-align: center;
+  font-size: 1.1em;
+  color: #555;
+  font-weight: bold;
+}
+
+.latest-snapshot {
+  margin-top: 15px;
+  padding: 15px;
+  background: white;
+  border-radius: 8px;
+}
+
+.latest-snapshot h4 {
+  color: #667eea;
+  margin-top: 0;
+  margin-bottom: 10px;
+}
+
+.latest-snapshot div {
+  padding: 5px 0;
+  color: #555;
+}
+
+.depth-by-percentage {
+  margin-top: 20px;
+}
+
+.depth-by-percentage h4 {
+  margin-bottom: 15px;
+  color: #333;
+}
+
+.pnl-card {
+  background: linear-gradient(135deg, #ffeaa7 0%, #fdcb6e 100%);
+}
+
+.pnl-card h3 {
+  color: #2d3436;
+  margin-bottom: 20px;
+}
+
+.pnl-period {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  padding: 15px;
+  background: rgba(255, 255, 255, 0.7);
+  border-radius: 8px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.pnl-period div {
+  color: #2d3436;
+}
+
+.pnl-assets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 20px;
+}
+
+.pnl-asset-card {
+  background: white;
+  border-radius: 10px;
+  padding: 20px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.pnl-asset-card h4 {
+  margin-top: 0;
+  margin-bottom: 15px;
+  color: #667eea;
+  font-size: 1.2em;
+  border-bottom: 2px solid #667eea;
+  padding-bottom: 10px;
+}
+
+.pnl-avg-price {
+  background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+  border: 2px solid #667eea;
+}
+
+.pnl-avg-price h4 {
+  color: #2d3436;
+  border-bottom: 2px solid #2d3436;
+}
+
+.price-calculation {
+  margin-top: 10px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.6);
+  border-radius: 5px;
+  text-align: center;
+}
+
+.price-calculation small {
+  color: #636e72;
+  font-family: monospace;
+}
+
+.pnl-details div {
+  padding: 8px 0;
+  color: #555;
+}
+
+.pnl-details .positive {
+  color: #27ae60;
+  background: linear-gradient(135deg, #d4fc79 0%, #96e6a1 100%);
+  padding: 10px;
+  border-radius: 6px;
+  margin-top: 10px;
+}
+
+.pnl-details .negative {
+  color: #e74c3c;
+  background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+  padding: 10px;
+  border-radius: 6px;
+  margin-top: 10px;
+}
+
+.error-banner {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #e74c3c;
+  color: white;
+  padding: 15px 30px;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 1000;
+}
+
+strong {
+  font-weight: 600;
+}
+
+@media (max-width: 768px) {
+  .App {
+    padding: 10px;
+  }
+
+  .App-header h1 {
+    font-size: 1.8em;
+  }
+
+  .exchange-name {
+    font-size: 1.4em;
+  }
+
+  .balance-grid,
+  .order-sides,
+  .pnl-assets {
+    grid-template-columns: 1fr;
+  }
+
+  .pnl-period {
+    flex-direction: column;
+  }
+
+  .market-price {
+    flex-direction: column;
+    gap: 10px;
+  }
+}

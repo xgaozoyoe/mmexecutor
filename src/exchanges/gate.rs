@@ -102,23 +102,372 @@ impl Exchange for GateExchange {
     }
 
     async fn get_account_info(&self) -> Result<AccountInfo> {
-        anyhow::bail!("Gate.io implementation not yet complete - get_account_info")
+        let timestamp = Self::get_timestamp();
+        let url_path = "/api/v4/spot/accounts";
+        let body_hash = format!("{:x}", sha2::Sha512::digest(b""));
+        let signature = self.generate_signature("GET", url_path, "", &body_hash, timestamp);
+
+        let url = format!("{}{}", BASE_URL, url_path);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KEY", &self.api_key)
+            .header("Timestamp", timestamp.to_string())
+            .header("SIGN", signature)
+            .send()
+            .await
+            .context("Failed to get account info")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get account info: {}", error_text);
+        }
+
+        // Gate.io returns array of balances directly: [{"currency": "BTC", "available": "1.0", "locked": "0.0"}]
+        let gate_balances: Vec<serde_json::Value> = response
+            .json()
+            .await
+            .context("Failed to parse Gate.io account balances")?;
+
+        // Convert Gate.io format to unified format
+        let balances: Vec<Balance> = gate_balances
+            .into_iter()
+            .map(|v| Balance {
+                asset: v["currency"].as_str().unwrap_or("").to_string(),
+                free: v["available"].as_str().unwrap_or("0").to_string(),
+                locked: v["locked"].as_str().unwrap_or("0").to_string(),
+            })
+            .collect();
+
+        Ok(AccountInfo { balances })
     }
 
     async fn get_open_orders(&self, symbol: Option<&str>) -> Result<Vec<OpenOrder>> {
-        anyhow::bail!("Gate.io implementation not yet complete - get_open_orders")
+        let timestamp = Self::get_timestamp();
+        let url_path = "/api/v4/spot/open_orders";
+
+        let query_string = if let Some(sym) = symbol {
+            let gate_symbol = sym.replace("USDT", "_USDT")
+                .replace("USDC", "_USDC")
+                .replace("BTC", "_BTC")
+                .replace("ETH", "_ETH");
+            format!("currency_pair={}", gate_symbol)
+        } else {
+            String::new()
+        };
+
+        let body_hash = format!("{:x}", sha2::Sha512::digest(b""));
+        let signature = self.generate_signature("GET", url_path, &query_string, &body_hash, timestamp);
+
+        let url = if query_string.is_empty() {
+            format!("{}{}", BASE_URL, url_path)
+        } else {
+            format!("{}{}?{}", BASE_URL, url_path, query_string)
+        };
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KEY", &self.api_key)
+            .header("Timestamp", timestamp.to_string())
+            .header("SIGN", signature)
+            .send()
+            .await
+            .context("Failed to get open orders")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get open orders: {}", error_text);
+        }
+
+        let response_text = response.text().await?;
+
+        // Gate.io v4 API returns a wrapper object with "orders" array
+        let response_value: serde_json::Value = serde_json::from_str(&response_text)
+            .context("Failed to parse open orders response")?;
+
+        // Extract the orders array from the response
+        let gate_orders = if response_value.is_array() {
+            let arr = response_value.as_array().unwrap();
+            if !arr.is_empty() && arr[0].get("orders").is_some() {
+                // New format: array containing wrapper object(s) with "orders" field
+                // Example: [{"currency_pair":"ZKWASM_USDT","total":7,"orders":[...]}]
+                arr[0].get("orders")
+                    .and_then(|orders| orders.as_array())
+                    .unwrap_or(&vec![])
+                    .clone()
+            } else {
+                // Old format: direct array of orders
+                arr.clone()
+            }
+        } else if let Some(orders) = response_value.get("orders") {
+            // Alternative format: single wrapper object with "orders" field
+            orders.as_array()
+                .context("'orders' field is not an array")?
+                .clone()
+        } else {
+            // Fallback to empty array
+            vec![]
+        };
+
+        let open_orders: Vec<OpenOrder> = gate_orders
+            .into_iter()
+            .map(|v| {
+                // Gate.io API fields:
+                // - amount: 订单总数量
+                // - left: 剩余未成交数量
+                // - filled_amount: 已成交数量
+                // Use filled_amount directly or calculate from amount - left
+                let amount: f64 = v["amount"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                let filled_amount: f64 = v["filled_amount"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+
+                // Fallback to calculate if filled_amount is not available
+                let executed = if filled_amount > 0.0 {
+                    filled_amount
+                } else {
+                    let left: f64 = v["left"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    amount - left
+                };
+
+                OpenOrder {
+                    symbol: v["currency_pair"].as_str().unwrap_or("").replace("_", ""),
+                    order_id: v["id"].as_str().unwrap_or("").to_string(),
+                    price: v["price"].as_str().unwrap_or("0").to_string(),
+                    orig_qty: v["amount"].as_str().unwrap_or("0").to_string(),
+                    executed_qty: executed.to_string(),
+                    status: v["status"].as_str().unwrap_or("open").to_uppercase(),
+                    side: v["side"].as_str().unwrap_or("").to_uppercase(),
+                    order_type: v["type"].as_str().unwrap_or("limit").to_uppercase(),
+                    time: v["create_time"].as_i64().unwrap_or(0) * 1000,
+                }
+            })
+            .collect();
+
+        Ok(open_orders)
     }
 
     async fn get_all_orders(&self, symbol: &str, limit: Option<u32>) -> Result<Vec<OpenOrder>> {
-        anyhow::bail!("Gate.io implementation not yet complete - get_all_orders")
+        let gate_symbol = symbol.replace("USDT", "_USDT")
+            .replace("USDC", "_USDC")
+            .replace("BTC", "_BTC")
+            .replace("ETH", "_ETH");
+
+        let limit = limit.unwrap_or(100);
+        let half_limit = limit / 2;
+
+        // Gate.io requires 'status' parameter, so we fetch both open and finished orders
+        // Fetch open orders
+        let mut all_orders = Vec::new();
+
+        // Fetch finished orders
+        let timestamp = Self::get_timestamp();
+        let url_path = "/api/v4/spot/orders";
+        let query_string = format!("currency_pair={}&limit={}&status=finished", gate_symbol, limit);
+
+        let body_hash = format!("{:x}", sha2::Sha512::digest(b""));
+        let signature = self.generate_signature("GET", url_path, &query_string, &body_hash, timestamp);
+
+        let url = format!("{}{}?{}", BASE_URL, url_path, query_string);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KEY", &self.api_key)
+            .header("Timestamp", timestamp.to_string())
+            .header("SIGN", signature)
+            .send()
+            .await
+            .context("Failed to get finished orders")?;
+
+        if response.status().is_success() {
+            if let Ok(gate_orders) = response.json::<Vec<serde_json::Value>>().await {
+                for v in gate_orders {
+                    let amount: f64 = v["amount"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    let filled_amount: f64 = v["filled_amount"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+
+                    let executed = if filled_amount > 0.0 {
+                        filled_amount
+                    } else {
+                        let left: f64 = v["left"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                        amount - left
+                    };
+
+                    all_orders.push(OpenOrder {
+                        symbol: v["currency_pair"].as_str().unwrap_or("").replace("_", ""),
+                        order_id: v["id"].as_str().unwrap_or("").to_string(),
+                        price: v["price"].as_str().unwrap_or("0").to_string(),
+                        orig_qty: v["amount"].as_str().unwrap_or("0").to_string(),
+                        executed_qty: executed.to_string(),
+                        status: v["status"].as_str().unwrap_or("finished").to_uppercase(),
+                        side: v["side"].as_str().unwrap_or("").to_uppercase(),
+                        order_type: v["type"].as_str().unwrap_or("limit").to_uppercase(),
+                        time: v["create_time"].as_i64().unwrap_or(0) * 1000,
+                    });
+                }
+            }
+        }
+
+        // Also fetch open orders (which might be partially filled)
+        let timestamp2 = Self::get_timestamp();
+        let query_string2 = format!("currency_pair={}&limit={}", gate_symbol, half_limit);
+        let body_hash2 = format!("{:x}", sha2::Sha512::digest(b""));
+        let signature2 = self.generate_signature("GET", "/api/v4/spot/open_orders", &query_string2, &body_hash2, timestamp2);
+        let url2 = format!("{}/api/v4/spot/open_orders?{}", BASE_URL, query_string2);
+
+        if let Ok(response2) = self
+            .client
+            .get(&url2)
+            .header("KEY", &self.api_key)
+            .header("Timestamp", timestamp2.to_string())
+            .header("SIGN", signature2)
+            .send()
+            .await
+        {
+            if response2.status().is_success() {
+                // Handle Gate.io v4 API response which might be wrapped in an object
+                if let Ok(response_text) = response2.text().await {
+                    let response_value: serde_json::Value = serde_json::from_str(&response_text).unwrap_or(serde_json::json!([]));
+
+                    let gate_orders = if response_value.is_array() {
+                        let arr = response_value.as_array().unwrap();
+                        if !arr.is_empty() && arr[0].get("orders").is_some() {
+                            // New format: array containing wrapper object(s)
+                            arr[0].get("orders")
+                                .and_then(|orders| orders.as_array())
+                                .unwrap_or(&vec![])
+                                .clone()
+                        } else {
+                            // Old format: direct array
+                            arr.clone()
+                        }
+                    } else if let Some(orders) = response_value.get("orders") {
+                        orders.as_array().unwrap_or(&vec![]).clone()
+                    } else {
+                        vec![]
+                    };
+
+                    for v in gate_orders {
+                        let amount: f64 = v["amount"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                        let filled_amount: f64 = v["filled_amount"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+
+                        let executed = if filled_amount > 0.0 {
+                            filled_amount
+                        } else {
+                            let left: f64 = v["left"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                            amount - left
+                        };
+
+                        all_orders.push(OpenOrder {
+                            symbol: v["currency_pair"].as_str().unwrap_or("").replace("_", ""),
+                            order_id: v["id"].as_str().unwrap_or("").to_string(),
+                            price: v["price"].as_str().unwrap_or("0").to_string(),
+                            orig_qty: v["amount"].as_str().unwrap_or("0").to_string(),
+                            executed_qty: executed.to_string(),
+                            status: v["status"].as_str().unwrap_or("open").to_uppercase(),
+                            side: v["side"].as_str().unwrap_or("").to_uppercase(),
+                            order_type: v["type"].as_str().unwrap_or("limit").to_uppercase(),
+                            time: v["create_time"].as_i64().unwrap_or(0) * 1000,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(all_orders)
     }
 
     async fn get_my_trades(&self, symbol: &str, limit: Option<u32>) -> Result<Vec<Trade>> {
-        anyhow::bail!("Gate.io implementation not yet complete - get_my_trades")
+        let timestamp = Self::get_timestamp();
+        let url_path = "/api/v4/spot/my_trades";
+
+        let gate_symbol = symbol.replace("USDT", "_USDT")
+            .replace("USDC", "_USDC")
+            .replace("BTC", "_BTC")
+            .replace("ETH", "_ETH");
+
+        let limit = limit.unwrap_or(100);
+        let query_string = format!("currency_pair={}&limit={}", gate_symbol, limit);
+
+        let body_hash = format!("{:x}", sha2::Sha512::digest(b""));
+        let signature = self.generate_signature("GET", url_path, &query_string, &body_hash, timestamp);
+
+        let url = format!("{}{}?{}", BASE_URL, url_path, query_string);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KEY", &self.api_key)
+            .header("Timestamp", timestamp.to_string())
+            .header("SIGN", signature)
+            .send()
+            .await
+            .context("Failed to get my trades")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get my trades: {}", error_text);
+        }
+
+        let gate_trades: Vec<serde_json::Value> = response
+            .json()
+            .await
+            .context("Failed to parse my trades")?;
+
+        let trades: Vec<Trade> = gate_trades
+            .into_iter()
+            .map(|v| Trade {
+                symbol: v["currency_pair"].as_str().unwrap_or("").replace("_", ""),
+                id: v["id"].as_str().unwrap_or("").to_string(),
+                order_id: v["order_id"].as_str().unwrap_or("").to_string(),
+                price: v["price"].as_str().unwrap_or("0").to_string(),
+                qty: v["amount"].as_str().unwrap_or("0").to_string(),
+                quote_qty: v["role"].as_str().unwrap_or("0").to_string(),
+                commission: v["fee"].as_str().unwrap_or("0").to_string(),
+                commission_asset: v["fee_currency"].as_str().unwrap_or("").to_string(),
+                time: v["create_time"].as_i64().unwrap_or(0) * 1000,
+                is_buyer: v["side"].as_str().unwrap_or("") == "buy",
+                is_maker: v["role"].as_str().unwrap_or("") == "maker",
+            })
+            .collect();
+
+        Ok(trades)
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<serde_json::Value> {
-        anyhow::bail!("Gate.io implementation not yet complete - cancel_order")
+        let timestamp = Self::get_timestamp();
+        let url_path = format!("/api/v4/spot/orders/{}", order_id);
+
+        let gate_symbol = symbol.replace("USDT", "_USDT")
+            .replace("USDC", "_USDC")
+            .replace("BTC", "_BTC")
+            .replace("ETH", "_ETH");
+
+        let query_string = format!("currency_pair={}", gate_symbol);
+
+        let body_hash = format!("{:x}", sha2::Sha512::digest(b""));
+        let signature = self.generate_signature("DELETE", &url_path, &query_string, &body_hash, timestamp);
+
+        let url = format!("{}{}?{}", BASE_URL, url_path, query_string);
+
+        let response = self
+            .client
+            .delete(&url)
+            .header("KEY", &self.api_key)
+            .header("Timestamp", timestamp.to_string())
+            .header("SIGN", signature)
+            .send()
+            .await
+            .context("Failed to cancel order")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to cancel order: {}", error_text);
+        }
+
+        let response_text = response.text().await?;
+        serde_json::from_str(&response_text)
+            .context(format!("Failed to parse cancel order response. Raw response: {}", response_text))
     }
 
     async fn place_batch_limit_orders(
@@ -129,67 +478,101 @@ impl Exchange for GateExchange {
             return Ok(Vec::new());
         }
 
-        let timestamp = Self::get_timestamp();
+        // Gate.io has strict rate limits, split into smaller batches
+        const BATCH_SIZE: usize = 4; // Conservative batch size to avoid rate limits
+        const BATCH_DELAY_MS: u64 = 300; // 300ms delay between batches
 
-        // 构建批量订单数据
-        let batch_orders: Vec<serde_json::Value> = orders
-            .iter()
-            .map(|order| {
-                // Gate.io 使用 BTC_USDT 格式
-                let gate_symbol = order.symbol.replace("USDT", "_USDT")
-                    .replace("USDC", "_USDC")
-                    .replace("BTC", "_BTC")
-                    .replace("ETH", "_ETH");
+        let mut all_results = Vec::new();
 
-                serde_json::json!({
-                    "currency_pair": gate_symbol,
-                    "type": "limit",
-                    "account": "spot",
-                    "side": order.side.to_lowercase(),
-                    "amount": order.quantity.to_string(),
-                    "price": order.price.to_string(),
-                    "time_in_force": "gtc"
+        // Process orders in smaller batches
+        let total_batches = (orders.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+
+        for (batch_idx, chunk) in orders.chunks(BATCH_SIZE).enumerate() {
+            // Add delay between batches (except for first batch)
+            if batch_idx > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(BATCH_DELAY_MS)).await;
+            }
+
+            if total_batches > 1 {
+                println!("  📦 Gate.io batch {}/{} ({} orders)...", batch_idx + 1, total_batches, chunk.len());
+            }
+
+            let timestamp = Self::get_timestamp();
+
+            // 构建批量订单数据
+            let batch_orders: Vec<serde_json::Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(idx, order)| {
+                    // Gate.io 使用 BTC_USDT 格式
+                    let gate_symbol = order.symbol.replace("USDT", "_USDT")
+                        .replace("USDC", "_USDC")
+                        .replace("BTC", "_BTC")
+                        .replace("ETH", "_ETH");
+
+                    // Generate unique client order ID (Gate.io requires 't-' prefix)
+                    let client_order_id = format!("t-grid{}_{}", timestamp, batch_idx * BATCH_SIZE + idx);
+
+                    serde_json::json!({
+                        "text": client_order_id,
+                        "currency_pair": gate_symbol,
+                        "type": "limit",
+                        "account": "spot",
+                        "side": order.side.to_lowercase(),
+                        "amount": order.quantity.to_string(),
+                        "price": order.price.to_string(),
+                        "time_in_force": "gtc"
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        let body = serde_json::to_string(&batch_orders)?;
-        let body_hash = format!("{:x}", sha2::Sha512::digest(body.as_bytes()));
+            let body = serde_json::to_string(&batch_orders)?;
+            let body_hash = format!("{:x}", sha2::Sha512::digest(body.as_bytes()));
 
-        let url_path = "/api/v4/spot/batch_orders";
-        let signature = self.generate_signature("POST", url_path, "", &body_hash, timestamp);
+            let url_path = "/api/v4/spot/batch_orders";
+            let signature = self.generate_signature("POST", url_path, "", &body_hash, timestamp);
 
-        let url = format!("{}{}", BASE_URL, url_path);
+            let url = format!("{}{}", BASE_URL, url_path);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("KEY", &self.api_key)
-            .header("Timestamp", timestamp.to_string())
-            .header("SIGN", signature)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .context("Failed to place batch orders")?;
+            let response = self
+                .client
+                .post(&url)
+                .header("KEY", &self.api_key)
+                .header("Timestamp", timestamp.to_string())
+                .header("SIGN", signature)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .context("Failed to place batch orders")?;
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            anyhow::bail!("Gate.io batch order failed: {}", error_text);
-        }
+            if !response.status().is_success() {
+                let error_text = response.text().await?;
 
-        let response_text = response.text().await?;
+                // If rate limited, add longer delay and continue
+                if error_text.contains("TOO_MANY_REQUESTS") || error_text.contains("Rate Limit") {
+                    eprintln!("⚠️  Gate.io rate limit hit, waiting 2 seconds before retry...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        // Gate.io 批量下单返回的格式需要适配到 OrderResponse
-        // 这里简化处理，返回成功
-        let gate_responses: Vec<serde_json::Value> = serde_json::from_str(&response_text)
-            .context(format!("Failed to parse Gate.io batch response: {}", response_text))?;
+                    // Mark these orders as failed
+                    for _ in chunk {
+                        all_results.push(Err(anyhow::anyhow!("Rate limit exceeded")));
+                    }
+                    continue;
+                }
 
-        // 将 Gate.io 响应转换为 OrderResponse
-        let results: Vec<Result<OrderResponse>> = gate_responses
-            .into_iter()
-            .map(|v| {
-                Ok(OrderResponse {
+                anyhow::bail!("Gate.io batch order failed: {}", error_text);
+            }
+
+            let response_text = response.text().await?;
+
+            // Gate.io 批量下单返回的格式需要适配到 OrderResponse
+            let gate_responses: Vec<serde_json::Value> = serde_json::from_str(&response_text)
+                .context(format!("Failed to parse Gate.io batch response: {}", response_text))?;
+
+            // 将 Gate.io 响应转换为 OrderResponse
+            for v in gate_responses {
+                all_results.push(Ok(OrderResponse {
                     symbol: v["currency_pair"].as_str().unwrap_or("").to_string(),
                     order_id: v["id"].as_str().unwrap_or("").to_string(),
                     order_list_id: 0,
@@ -199,10 +582,10 @@ impl Exchange for GateExchange {
                     stp_mode: "".to_string(),
                     side: v["side"].as_str().unwrap_or("").to_uppercase(),
                     transact_time: v["create_time"].as_i64().unwrap_or(0),
-                })
-            })
-            .collect();
+                }));
+            }
+        }
 
-        Ok(results)
+        Ok(all_results)
     }
 }

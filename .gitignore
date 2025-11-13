@@ -7,9 +7,21 @@ Cargo.lock
 config.json
 *.json
 !example_config.json
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
 
 # State files
 .state_*.json
+
+# Frontend / Node.js
+frontend/node_modules/
+frontend/build/
+frontend/.env
+frontend/.env.local
+frontend/.env.production.local
+frontend/.env.development.local
+frontend/.env.test.local
 
 # IDE
 .idea/

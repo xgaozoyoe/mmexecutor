@@ -10,7 +10,7 @@
 
 ## 功能特点
 
-- 🔌 **多交易所支持** - 统一的接口，轻松切换交易所
+- 🔌 **多交易所支持** - 单个配置文件同时管理多个交易所账户，使用统一网格参数
 - 🚀 **批量订单 API** - 使用交易所原生批量下单接口，显著提升下单速度
 - 📊 **智能网格布单** - 在当前价格附近自动计算并放置网格订单
 - 📈 **动态订单深度** - 根据距离当前价格的远近调整订单深度：
@@ -22,6 +22,13 @@
   - 总买入和卖出价值
   - 网格层数
 - 📋 **订单管理** - 查询挂单、历史订单和交易记录
+- 📸 **账户快照和盈亏追踪** - 自动记录每次布单后的账户状态，实时分析盈亏
+- 🔄 **Watch 模式** - 持续监控模式，定期自动检查并布单，记录账户变化
+- 🎨 **实时监控仪表板** - REST API + React 前端，提供实时数据可视化
+  - 账户余额、市场深度、订单深度
+  - 盈亏分析、快照历史
+  - 自动刷新（每30秒）
+  - 响应式设计，支持移动设备
 - ⚡ **高性能** - 使用 Rust 异步编程，批量 API 调用
 
 ## 快速开始
@@ -70,15 +77,30 @@ cargo run -- --create-config config.json
 
 ### 2. 编辑配置文件
 
-打开 `config.json` 并填入你的配置。根据不同交易所，配置格式略有不同：
+打开 `config.json` 并填入你的配置。配置文件支持多个交易所，所有交易所共享相同的网格参数：
 
-#### MEXC 配置示例
+#### 多交易所配置示例
 
 ```json
 {
-  "exchange": "mexc",
-  "api_key": "your_mexc_api_key",
-  "api_secret": "your_mexc_api_secret",
+  "exchanges": [
+    {
+      "name": "mexc",
+      "api_key": "your_mexc_api_key",
+      "api_secret": "your_mexc_api_secret"
+    },
+    {
+      "name": "gate",
+      "api_key": "your_gate_api_key",
+      "api_secret": "your_gate_api_secret"
+    },
+    {
+      "name": "kucoin",
+      "api_key": "your_kucoin_api_key",
+      "api_secret": "your_kucoin_api_secret",
+      "api_passphrase": "your_kucoin_api_passphrase"
+    }
+  ],
   "grid": {
     "symbol": "BTCUSDT",
     "buy_price_percentage": 5.0,
@@ -91,49 +113,16 @@ cargo run -- --create-config config.json
 }
 ```
 
-#### Gate.io 配置示例
-
-```json
-{
-  "exchange": "gate",
-  "api_key": "your_gate_api_key",
-  "api_secret": "your_gate_api_secret",
-  "grid": {
-    "symbol": "BTCUSDT",
-    "buy_price_percentage": 5.0,
-    "sell_price_percentage": 5.0,
-    "grid_interval_percentage": 0.5,
-    "total_buy_value": 100.0,
-    "total_sell_value": 100.0,
-    "grid_levels": 10
-  }
-}
-```
-
-#### KuCoin 配置示例
-
-```json
-{
-  "exchange": "kucoin",
-  "api_key": "your_kucoin_api_key",
-  "api_secret": "your_kucoin_api_secret",
-  "api_passphrase": "your_kucoin_api_passphrase",
-  "grid": {
-    "symbol": "BTCUSDT",
-    "buy_price_percentage": 5.0,
-    "sell_price_percentage": 5.0,
-    "grid_interval_percentage": 0.5,
-    "total_buy_value": 100.0,
-    "total_sell_value": 100.0,
-    "grid_levels": 10
-  }
-}
-```
+**注意：**
+- 你可以配置一个或多个交易所
+- 所有交易所将使用相同的网格参数（`grid` 配置）
+- 每个交易所独立执行布单和查询操作
+- KuCoin 需要额外的 `api_passphrase` 字段
 
 #### 配置参数说明
 
-**通用参数：**
-- `exchange`: 交易所名称（"mexc" | "gate" | "kucoin"）
+**交易所配置（exchanges 数组）：**
+- `name`: 交易所名称（"mexc" | "gate" | "kucoin"）
 - `api_key`: 交易所 API Key
 - `api_secret`: 交易所 API Secret
 - `api_passphrase`: API 密码短语（仅 KuCoin 需要）
@@ -146,6 +135,23 @@ cargo run -- --create-config config.json
 - `total_buy_value`: 买单总价值（USDT）
 - `total_sell_value`: 卖单对应的币数总价值（USDT）
 - `grid_levels`: 网格层数
+- `minimal_order_value`: 最小订单总价值，低于此值不布单
+
+**中间价计算参数（可选）：**
+- `mid_price_method_bid`: Bid 价格计算方法（默认 `"simple"`），可选：
+  - `"simple"`: 直接取最优买价
+  - `"weighted_by_volume"`: 按订单量加权平均
+  - `"volume_threshold"`: 基于最近成交买单价值的深度阈值（推荐）
+- `mid_price_method_ask`: Ask 价格计算方法（默认 `"simple"`），可选：
+  - `"simple"`: 直接取最优卖价
+  - `"weighted_by_volume"`: 按订单量加权平均
+  - `"volume_threshold"`: 基于阈值（较少使用）
+- `orderbook_depth`: 获取的订单簿深度档位（默认 20）
+- `volume_threshold_usdt`: VolumeThreshold 方法的默认阈值，单位 USDT（默认 100.0）
+  - 当没有成交历史时使用此阈值
+  - 可根据交易对流动性调整，主流币可设置更大值（如 500-1000）
+
+详细说明请参考：[PRICE_CALCULATION.md](PRICE_CALCULATION.md)
 
 ### 获取交易所 API 密钥
 
@@ -211,12 +217,15 @@ cargo run --release -- place config.json
 
 运行流程：
 1. 程序会读取配置文件
-2. 获取指定交易对的当前价格
-3. 根据配置计算所有网格订单
-4. 显示订单预览（包括价格、数量、价值）
-5. 询问是否执行下单
-6. 如果确认，使用批量订单 API 快速下单
-7. 显示下单结果统计
+2. 遍历所有配置的交易所
+3. 对每个交易所：
+   - 获取指定交易对的当前价格
+   - 根据配置计算所有网格订单
+   - 显示订单预览（包括价格、数量、价值）
+   - 询问是否执行下单（首个交易所）
+   - 如果确认，使用批量订单 API 快速下单
+   - 显示下单结果统计
+4. 所有交易所处理完成后显示总体结果
 
 **性能优化：**
 - 程序使用各交易所的批量订单 API，显著提升下单速度
@@ -226,23 +235,13 @@ cargo run --release -- place config.json
 
 ### 3. 查询当前挂单
 
-查询配置文件中指定交易对的挂单：
+查询所有配置交易所的挂单：
 
 ```bash
 cargo run --release -- orders [配置文件路径]
 ```
 
-查询所有交易对的挂单：
-
-```bash
-cargo run --release -- orders --all
-```
-
-或简写：
-
-```bash
-cargo run --release -- orders -a
-```
+程序会遍历配置文件中的所有交易所，分别显示每个交易所的挂单情况。
 
 输出示例：
 ```
@@ -261,7 +260,7 @@ Total unfilled value: 1000.00 USDT
 
 ### 4. 查询历史交易记录
 
-查询最近 50 条交易记录（默认）：
+查询所有配置交易所最近 50 条交易记录（默认）：
 
 ```bash
 cargo run --release -- trades [配置文件路径]
@@ -279,6 +278,8 @@ cargo run --release -- trades --limit 100
 cargo run --release -- trades -l 100
 ```
 
+程序会遍历配置文件中的所有交易所，分别显示每个交易所的交易记录。
+
 输出示例：
 ```
 Fetching trades for BTCUSDT...
@@ -294,6 +295,114 @@ Total BUY value:  497.50 USDT
 Total SELL value: 502.50 USDT
 Total fees:       0.01000
 Net profit/loss:  5.00 USDT (1.00%)
+```
+
+### 5. 取消所有挂单
+
+```bash
+cargo run --release -- cancel [配置文件路径]
+```
+
+强制取消（不需要确认）：
+
+```bash
+cargo run --release -- cancel --force
+```
+
+### 6. 持续布单模式（Watch）
+
+启动持续监控模式，定期自动检查并布单：
+
+```bash
+cargo run --release -- watch [配置文件路径]
+```
+
+自定义检查间隔（默认 120 秒）：
+
+```bash
+cargo run --release -- watch --interval 300  # 每5分钟检查一次
+```
+
+或简写：
+
+```bash
+cargo run --release -- watch -i 300
+```
+
+Watch 模式特点：
+- 🔄 定期自动检查市场并布单
+- 📸 每次布单后自动记录账户快照
+- 📊 实时显示账户变化和盈亏
+- 💾 所有快照保存到 `.account_snapshots_{交易所}_{交易对}.jsonl` 文件
+- ⏸️ 按 Ctrl+C 可停止运行
+
+### 7. 实时监控仪表板（Report Dashboard）
+
+启动 REST API 服务器和 React 前端，提供实时数据可视化：
+
+```bash
+# 快速启动（推荐）
+./start_dashboard.sh
+
+# 或手动启动后端
+cargo run --release -- report [配置文件路径]
+
+# 自定义端口
+cargo run --release -- report --port 8080
+```
+
+仪表板功能：
+- 📊 **账户余额** - 实时显示各资产的可用、锁定和总余额
+- 📈 **市场深度** - 当前价格和各价格区间的订单簿深度（±0.5%, ±1%, ±2%, ±5%, ±10%）
+- 📋 **我的订单深度** - 你的挂单统计（数量、价格范围、总价值），不显示具体订单
+- 📸 **快照历史** - 账户快照数量和最新快照信息
+- 💹 **盈亏统计** - 时间段内的收益变化和百分比
+- 🔄 **自动刷新** - 每30秒自动更新数据
+- 📱 **响应式设计** - 支持桌面和移动设备
+
+访问地址：
+- **后端 API**: `http://localhost:3000/api/report`
+- **健康检查**: `http://localhost:3000/health`
+- **前端界面**: `http://localhost:3000` (或下一个可用端口)
+
+详细使用说明请参考：[REPORT_DASHBOARD.md](REPORT_DASHBOARD.md)
+
+输出示例：
+```
+╔════════════════════════════════════════════════════════╗
+║              LATEST ACCOUNT STATUS                     ║
+╚════════════════════════════════════════════════════════╝
+
+📅 Timestamp: 2025-01-15 10:30:45 UTC
+🔄 Iteration: #25
+💹 Mid Price: 50000.123456
+
+🪙 Assets:
+  🪙 BTC       Free:      0.02000000  Locked:      0.00500000  Total:      0.02500000
+  💵 USDT      Free:   1250.50000000  Locked:    250.00000000  Total:   1500.50000000
+
+💰 Total Value: 2751.00 USDT
+
+╔════════════════════════════════════════════════════════╗
+║            DETAILED PERIOD ANALYSIS                    ║
+╚════════════════════════════════════════════════════════╝
+
+📊 Overall Statistics:
+  Total Snapshots: 25
+  Total Iterations: 24
+  Profitable Iterations: 18 (75.0%)
+
+💰 Overall Performance:
+  Initial Value: 2500.00 USDT
+  Final Value:   2751.00 USDT
+  📈 Total P&L:    251.00 USDT (+10.04%)
+  Average per iteration: 10.46 USDT
+
+📈 Recent Iterations:
+  ✅ Iteration #21: +12.50 USDT (+0.46%)
+  ✅ Iteration #22: +8.30 USDT (+0.30%)
+  ❌ Iteration #23: -3.20 USDT (-0.12%)
+  ✅ Iteration #24: +15.60 USDT (+0.57%)
 ```
 
 ## 技术架构
@@ -342,6 +451,33 @@ pub trait Exchange: Send + Sync {
 这样可以确保：
 - 靠近当前价格的订单快速成交
 - 远离当前价格的订单提供更大的流动性
+
+## 状态文件管理
+
+程序会为每个交易所单独保存两类状态文件：
+
+### 1. 价格状态文件
+- 格式：`.state_{交易所名称}_{交易对}.json`
+- 例如：`.state_mexc_BTCUSDT.json`、`.state_gate_BTCUSDT.json`
+- 用途：跟踪上次布单的价格，实现价格下跌时自动取消买单
+
+### 2. 账户快照文件
+- 格式：`.account_snapshots_{交易所名称}_{交易对}.jsonl`
+- 例如：`.account_snapshots_mexc_BTCUSDT.jsonl`
+- 用途：记录每次布单后的账户状态（余额、价格、时间等）
+- 格式：每行一个 JSON 对象（JSONL 格式）
+- 内容包括：
+  - 时间戳和人类可读的日期时间
+  - 交易所名称和交易对
+  - 各资产的余额（可用、冻结、总计）
+  - 当时的中间价
+  - Watch 模式的迭代次数
+
+这些快照数据用于：
+- 追踪账户余额变化
+- 分析交易策略的盈亏
+- 生成详细的统计报告
+- 评估网格交易的整体表现
 
 ## 示例
 
@@ -447,7 +583,10 @@ src/
 │   ├── mexc.rs         # MEXC 实现
 │   ├── gate.rs         # Gate.io 实现
 │   └── kucoin.rs       # KuCoin 实现
-└── grid.rs             # 网格订单计算逻辑
+├── order_calculator.rs  # 网格订单计算逻辑
+├── price_calculator.rs  # 中间价计算逻辑
+├── state.rs            # 交易状态管理
+└── account_snapshot.rs  # 账户快照和盈亏分析
 ```
 
 ## 许可证

@@ -65,10 +65,17 @@ impl KucoinExchange {
 impl Exchange for KucoinExchange {
     async fn get_order_book(&self, symbol: &str, limit: Option<u32>) -> Result<OrderBook> {
         // KuCoin uses format: BTC-USDT
-        let kucoin_symbol = symbol.replace("USDT", "-USDT")
-            .replace("USDC", "-USDC")
-            .replace("BTC", "-BTC")
-            .replace("ETH", "-ETH");
+        let kucoin_symbol = if symbol.ends_with("USDT") {
+            symbol.replace("USDT", "-USDT")
+        } else if symbol.ends_with("USDC") {
+            symbol.replace("USDC", "-USDC")
+        } else if symbol.ends_with("BTC") {
+            symbol.replace("BTC", "-BTC")
+        } else if symbol.ends_with("ETH") {
+            symbol.replace("ETH", "-ETH")
+        } else {
+            symbol.to_string()
+        };
 
         let url = format!("{}/api/v1/market/orderbook/level2_{}",
             BASE_URL, if limit.unwrap_or(5) <= 20 { "20" } else { "100" });
@@ -81,10 +88,18 @@ impl Exchange for KucoinExchange {
             .await
             .context("Failed to get order book")?;
 
-        response
+        let kucoin_response: serde_json::Value = response
             .json()
             .await
-            .context("Failed to parse order book")
+            .context("Failed to parse KuCoin response")?;
+
+        // KuCoin returns: {"code":"200000","data":{"time":123,"sequence":"123","bids":[...],"asks":[...]}}
+        if let Some(data) = kucoin_response.get("data") {
+            serde_json::from_value(data.clone())
+                .context("Failed to parse order book from KuCoin data")
+        } else {
+            anyhow::bail!("Invalid KuCoin order book response format")
+        }
     }
 
     async fn get_mid_price(&self, symbol: &str) -> Result<f64> {
@@ -116,23 +131,283 @@ impl Exchange for KucoinExchange {
     }
 
     async fn get_account_info(&self) -> Result<AccountInfo> {
-        anyhow::bail!("KuCoin implementation not yet complete - get_account_info")
+        let timestamp = Self::get_timestamp();
+        let endpoint = "/api/v1/accounts";
+        let signature = self.generate_signature(timestamp, "GET", endpoint, "");
+        let passphrase_signature = self.generate_passphrase_signature();
+
+        let url = format!("{}{}", BASE_URL, endpoint);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KC-API-KEY", &self.api_key)
+            .header("KC-API-SIGN", signature)
+            .header("KC-API-TIMESTAMP", timestamp.to_string())
+            .header("KC-API-PASSPHRASE", passphrase_signature)
+            .header("KC-API-KEY-VERSION", "2")
+            .send()
+            .await
+            .context("Failed to get account info")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get account info: {}", error_text);
+        }
+
+        let kucoin_response: serde_json::Value = response.json().await?;
+
+        // KuCoin returns wrapped response: {"code":"200000","data":[{"id":"xxx","currency":"BTC","type":"trade","balance":"1.0","available":"1.0","holds":"0"}]}
+        if let Some(data) = kucoin_response.get("data") {
+            let kucoin_balances: Vec<serde_json::Value> = serde_json::from_value(data.clone())
+                .context("Failed to parse KuCoin account data")?;
+
+            // Convert KuCoin format to unified format
+            // Only include "trade" type accounts for spot trading
+            let balances: Vec<Balance> = kucoin_balances
+                .into_iter()
+                .filter(|v| {
+                    // Only include "trade" type accounts (spot trading)
+                    v["type"].as_str().unwrap_or("") == "trade"
+                })
+                .map(|v| Balance {
+                    asset: v["currency"].as_str().unwrap_or("").to_string(),
+                    free: v["available"].as_str().unwrap_or("0").to_string(),
+                    locked: v["holds"].as_str().unwrap_or("0").to_string(),
+                })
+                .collect();
+
+            Ok(AccountInfo { balances })
+        } else {
+            anyhow::bail!("Invalid KuCoin response format")
+        }
     }
 
     async fn get_open_orders(&self, symbol: Option<&str>) -> Result<Vec<OpenOrder>> {
-        anyhow::bail!("KuCoin implementation not yet complete - get_open_orders")
+        let timestamp = Self::get_timestamp();
+        let mut endpoint = "/api/v1/orders?status=active".to_string();
+
+        if let Some(sym) = symbol {
+            let kucoin_symbol = if sym.ends_with("USDT") {
+                sym.replace("USDT", "-USDT")
+            } else if sym.ends_with("USDC") {
+                sym.replace("USDC", "-USDC")
+            } else if sym.ends_with("BTC") {
+                sym.replace("BTC", "-BTC")
+            } else if sym.ends_with("ETH") {
+                sym.replace("ETH", "-ETH")
+            } else {
+                sym.to_string()
+            };
+            endpoint = format!("{}&symbol={}", endpoint, kucoin_symbol);
+        }
+
+        let signature = self.generate_signature(timestamp, "GET", &endpoint, "");
+        let passphrase_signature = self.generate_passphrase_signature();
+
+        let url = format!("{}{}", BASE_URL, endpoint);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KC-API-KEY", &self.api_key)
+            .header("KC-API-SIGN", signature)
+            .header("KC-API-TIMESTAMP", timestamp.to_string())
+            .header("KC-API-PASSPHRASE", passphrase_signature)
+            .header("KC-API-KEY-VERSION", "2")
+            .send()
+            .await
+            .context("Failed to get open orders")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get open orders: {}", error_text);
+        }
+
+        let kucoin_response: serde_json::Value = response.json().await?;
+
+        if let Some(data) = kucoin_response.get("data").and_then(|d| d.get("items")) {
+            let kucoin_orders: Vec<serde_json::Value> = serde_json::from_value(data.clone())?;
+
+            let open_orders: Vec<OpenOrder> = kucoin_orders
+                .into_iter()
+                .map(|v| OpenOrder {
+                    symbol: v["symbol"].as_str().unwrap_or("").replace("-", ""),
+                    order_id: v["id"].as_str().unwrap_or("").to_string(),
+                    price: v["price"].as_str().unwrap_or("0").to_string(),
+                    orig_qty: v["size"].as_str().unwrap_or("0").to_string(),
+                    executed_qty: v["dealSize"].as_str().unwrap_or("0").to_string(),
+                    status: if v["isActive"].as_bool().unwrap_or(false) { "OPEN" } else { "CLOSED" }.to_string(),
+                    side: v["side"].as_str().unwrap_or("").to_uppercase(),
+                    order_type: v["type"].as_str().unwrap_or("limit").to_uppercase(),
+                    time: v["createdAt"].as_i64().unwrap_or(0),
+                })
+                .collect();
+
+            Ok(open_orders)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     async fn get_all_orders(&self, symbol: &str, limit: Option<u32>) -> Result<Vec<OpenOrder>> {
-        anyhow::bail!("KuCoin implementation not yet complete - get_all_orders")
+        let timestamp = Self::get_timestamp();
+        let kucoin_symbol = if symbol.ends_with("USDT") {
+            symbol.replace("USDT", "-USDT")
+        } else if symbol.ends_with("USDC") {
+            symbol.replace("USDC", "-USDC")
+        } else if symbol.ends_with("BTC") {
+            symbol.replace("BTC", "-BTC")
+        } else if symbol.ends_with("ETH") {
+            symbol.replace("ETH", "-ETH")
+        } else {
+            symbol.to_string()
+        };
+
+        let endpoint = format!("/api/v1/orders?symbol={}", kucoin_symbol);
+        let signature = self.generate_signature(timestamp, "GET", &endpoint, "");
+        let passphrase_signature = self.generate_passphrase_signature();
+
+        let url = format!("{}{}", BASE_URL, endpoint);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KC-API-KEY", &self.api_key)
+            .header("KC-API-SIGN", signature)
+            .header("KC-API-TIMESTAMP", timestamp.to_string())
+            .header("KC-API-PASSPHRASE", passphrase_signature)
+            .header("KC-API-KEY-VERSION", "2")
+            .send()
+            .await
+            .context("Failed to get all orders")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get all orders: {}", error_text);
+        }
+
+        let kucoin_response: serde_json::Value = response.json().await?;
+
+        if let Some(data) = kucoin_response.get("data").and_then(|d| d.get("items")) {
+            let kucoin_orders: Vec<serde_json::Value> = serde_json::from_value(data.clone())?;
+
+            let all_orders: Vec<OpenOrder> = kucoin_orders
+                .into_iter()
+                .take(limit.unwrap_or(100) as usize)
+                .map(|v| OpenOrder {
+                    symbol: v["symbol"].as_str().unwrap_or("").replace("-", ""),
+                    order_id: v["id"].as_str().unwrap_or("").to_string(),
+                    price: v["price"].as_str().unwrap_or("0").to_string(),
+                    orig_qty: v["size"].as_str().unwrap_or("0").to_string(),
+                    executed_qty: v["dealSize"].as_str().unwrap_or("0").to_string(),
+                    status: if v["isActive"].as_bool().unwrap_or(false) { "OPEN" } else { "CLOSED" }.to_string(),
+                    side: v["side"].as_str().unwrap_or("").to_uppercase(),
+                    order_type: v["type"].as_str().unwrap_or("limit").to_uppercase(),
+                    time: v["createdAt"].as_i64().unwrap_or(0),
+                })
+                .collect();
+
+            Ok(all_orders)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     async fn get_my_trades(&self, symbol: &str, limit: Option<u32>) -> Result<Vec<Trade>> {
-        anyhow::bail!("KuCoin implementation not yet complete - get_my_trades")
+        let timestamp = Self::get_timestamp();
+        let kucoin_symbol = if symbol.ends_with("USDT") {
+            symbol.replace("USDT", "-USDT")
+        } else if symbol.ends_with("USDC") {
+            symbol.replace("USDC", "-USDC")
+        } else if symbol.ends_with("BTC") {
+            symbol.replace("BTC", "-BTC")
+        } else if symbol.ends_with("ETH") {
+            symbol.replace("ETH", "-ETH")
+        } else {
+            symbol.to_string()
+        };
+
+        let endpoint = format!("/api/v1/fills?symbol={}", kucoin_symbol);
+        let signature = self.generate_signature(timestamp, "GET", &endpoint, "");
+        let passphrase_signature = self.generate_passphrase_signature();
+
+        let url = format!("{}{}", BASE_URL, endpoint);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KC-API-KEY", &self.api_key)
+            .header("KC-API-SIGN", signature)
+            .header("KC-API-TIMESTAMP", timestamp.to_string())
+            .header("KC-API-PASSPHRASE", passphrase_signature)
+            .header("KC-API-KEY-VERSION", "2")
+            .send()
+            .await
+            .context("Failed to get my trades")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get my trades: {}", error_text);
+        }
+
+        let kucoin_response: serde_json::Value = response.json().await?;
+
+        if let Some(data) = kucoin_response.get("data").and_then(|d| d.get("items")) {
+            let kucoin_trades: Vec<serde_json::Value> = serde_json::from_value(data.clone())?;
+
+            let trades: Vec<Trade> = kucoin_trades
+                .into_iter()
+                .take(limit.unwrap_or(100) as usize)
+                .map(|v| Trade {
+                    symbol: v["symbol"].as_str().unwrap_or("").replace("-", ""),
+                    id: v["tradeId"].as_str().unwrap_or("").to_string(),
+                    order_id: v["orderId"].as_str().unwrap_or("").to_string(),
+                    price: v["price"].as_str().unwrap_or("0").to_string(),
+                    qty: v["size"].as_str().unwrap_or("0").to_string(),
+                    quote_qty: v["funds"].as_str().unwrap_or("0").to_string(),
+                    commission: v["fee"].as_str().unwrap_or("0").to_string(),
+                    commission_asset: v["feeCurrency"].as_str().unwrap_or("").to_string(),
+                    time: v["createdAt"].as_i64().unwrap_or(0),
+                    is_buyer: v["side"].as_str().unwrap_or("") == "buy",
+                    is_maker: v["liquidity"].as_str().unwrap_or("") == "maker",
+                })
+                .collect();
+
+            Ok(trades)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
-    async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<serde_json::Value> {
-        anyhow::bail!("KuCoin implementation not yet complete - cancel_order")
+    async fn cancel_order(&self, _symbol: &str, order_id: &str) -> Result<serde_json::Value> {
+        let timestamp = Self::get_timestamp();
+        let endpoint = format!("/api/v1/orders/{}", order_id);
+        let signature = self.generate_signature(timestamp, "DELETE", &endpoint, "");
+        let passphrase_signature = self.generate_passphrase_signature();
+
+        let url = format!("{}{}", BASE_URL, endpoint);
+
+        let response = self
+            .client
+            .delete(&url)
+            .header("KC-API-KEY", &self.api_key)
+            .header("KC-API-SIGN", signature)
+            .header("KC-API-TIMESTAMP", timestamp.to_string())
+            .header("KC-API-PASSPHRASE", passphrase_signature)
+            .header("KC-API-KEY-VERSION", "2")
+            .send()
+            .await
+            .context("Failed to cancel order")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to cancel order: {}", error_text);
+        }
+
+        let response_text = response.text().await?;
+        serde_json::from_str(&response_text)
+            .context(format!("Failed to parse cancel order response. Raw response: {}", response_text))
     }
 
     async fn place_batch_limit_orders(
@@ -146,8 +421,18 @@ impl Exchange for KucoinExchange {
         // KuCoin 支持批量下单，但需要注意最多5个订单
         // 如果超过5个，需要分批处理
         let mut all_results = Vec::new();
+        let total_batches = (orders.len() + 4) / 5;
 
-        for chunk in orders.chunks(5) {
+        for (batch_idx, chunk) in orders.chunks(5).enumerate() {
+            // Add delay between batches (except for first batch)
+            if batch_idx > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+
+            if total_batches > 1 {
+                println!("  📦 KuCoin batch {}/{} ({} orders)...", batch_idx + 1, total_batches, chunk.len());
+            }
+
             let timestamp = Self::get_timestamp();
 
             // 构建批量订单数据
@@ -155,18 +440,31 @@ impl Exchange for KucoinExchange {
                 .iter()
                 .map(|order| {
                     // KuCoin 使用 BTC-USDT 格式
-                    let kucoin_symbol = order.symbol.replace("USDT", "-USDT")
-                        .replace("USDC", "-USDC")
-                        .replace("BTC", "-BTC")
-                        .replace("ETH", "-ETH");
+                    // Need to insert hyphen before quote currency (USDT, USDC, BTC, ETH)
+                    let kucoin_symbol = if order.symbol.ends_with("USDT") {
+                        order.symbol.replace("USDT", "-USDT")
+                    } else if order.symbol.ends_with("USDC") {
+                        order.symbol.replace("USDC", "-USDC")
+                    } else if order.symbol.ends_with("BTC") {
+                        order.symbol.replace("BTC", "-BTC")
+                    } else if order.symbol.ends_with("ETH") {
+                        order.symbol.replace("ETH", "-ETH")
+                    } else {
+                        order.symbol.clone()
+                    };
+
+                    // Round price to 5 decimal places (priceIncrement = 0.00001)
+                    let rounded_price = (order.price * 100000.0).round() / 100000.0;
+                    // Round quantity to 1 decimal place (baseIncrement = 0.1)
+                    let rounded_quantity = (order.quantity * 10.0).round() / 10.0;
 
                     serde_json::json!({
                         "clientOid": format!("{}", uuid::Uuid::new_v4()),
                         "symbol": kucoin_symbol,
                         "type": "limit",
                         "side": order.side.to_lowercase(),
-                        "price": order.price.to_string(),
-                        "size": order.quantity.to_string(),
+                        "price": format!("{:.5}", rounded_price),
+                        "size": format!("{:.1}", rounded_quantity),
                     })
                 })
                 .collect();
@@ -176,7 +474,7 @@ impl Exchange for KucoinExchange {
             });
 
             let body = serde_json::to_string(&body_json)?;
-            let endpoint = "/api/v1/orders/multi";
+            let endpoint = "/api/v1/hf/orders/multi";
 
             let signature = self.generate_signature(timestamp, "POST", endpoint, &body);
             let passphrase_sign = self.generate_passphrase_signature();
@@ -203,23 +501,56 @@ impl Exchange for KucoinExchange {
             }
 
             let response_text = response.text().await?;
+
             let kucoin_response: serde_json::Value = serde_json::from_str(&response_text)
                 .context(format!("Failed to parse KuCoin batch response: {}", response_text))?;
 
-            // KuCoin 返回格式: {"code":"200000","data":{"data":[...]}}
-            if let Some(data) = kucoin_response["data"]["data"].as_array() {
-                for item in data {
-                    all_results.push(Ok(OrderResponse {
-                        symbol: chunk[0].symbol.clone(),
-                        order_id: item["orderId"].as_str().unwrap_or("").to_string(),
-                        order_list_id: 0,
-                        price: "0".to_string(),
-                        orig_qty: "0".to_string(),
-                        order_type: "LIMIT".to_string(),
-                        stp_mode: "".to_string(),
-                        side: chunk[0].side.clone(),
-                        transact_time: timestamp as i64,
-                    }));
+            // KuCoin HF API 返回格式: {"code":"200","msg":"success","data":[{"orderId":"...","success":true},...]}
+            if let Some(data) = kucoin_response.get("data").and_then(|d| d.as_array()) {
+                for (idx, item) in data.iter().enumerate() {
+                    if idx >= chunk.len() {
+                        // Safety check: shouldn't happen but prevent panic
+                        break;
+                    }
+
+                    // Check if order was successful
+                    let is_success = item.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+
+                    if is_success {
+                        if let Some(order_id) = item.get("orderId").and_then(|id| id.as_str()) {
+                            all_results.push(Ok(OrderResponse {
+                                symbol: chunk[idx].symbol.clone(),
+                                order_id: order_id.to_string(),
+                                order_list_id: 0,
+                                price: chunk[idx].price.to_string(),
+                                orig_qty: chunk[idx].quantity.to_string(),
+                                order_type: "LIMIT".to_string(),
+                                stp_mode: "".to_string(),
+                                side: chunk[idx].side.clone(),
+                                transact_time: timestamp as i64,
+                            }));
+                        } else {
+                            all_results.push(Err(anyhow::anyhow!("Order ID missing in response")));
+                        }
+                    } else {
+                        // Order failed
+                        let error_msg = item.get("msg")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Order placement failed");
+                        all_results.push(Err(anyhow::anyhow!("KuCoin order failed: {}", error_msg)));
+                    }
+                }
+
+                // If response has fewer items than expected, mark remaining as failed
+                if data.len() < chunk.len() {
+                    for _ in data.len()..chunk.len() {
+                        all_results.push(Err(anyhow::anyhow!("Order not in KuCoin response")));
+                    }
+                }
+            } else {
+                // No data field in response or not an array
+                for _ in chunk {
+                    all_results.push(Err(anyhow::anyhow!("Invalid KuCoin response format")));
                 }
             }
         }

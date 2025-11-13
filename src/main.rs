@@ -1,15 +1,20 @@
+mod account_snapshot;
+mod api_server;
 mod config;
 mod exchange;
 mod exchanges;
 mod order_calculator;
+mod price_calculator;
 mod state;
 
+use account_snapshot::{AccountSnapshot, AssetSnapshot, PnLAnalyzer, SnapshotHistory};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
 use exchange::Exchange;
 use exchanges::{create_exchange, ExchangeType};
 use order_calculator::OrderCalculator;
+use price_calculator::PriceCalculator;
 use state::TradingState;
 use std::io::Write;
 use std::sync::Arc;
@@ -41,9 +46,6 @@ enum Commands {
         /// 配置文件路径
         #[arg(default_value = "config.json")]
         config: String,
-        /// 是否显示所有交易对的挂单
-        #[arg(short, long)]
-        all: bool,
         /// 显示最近关闭的订单数量（默认 20，设为 0 则不显示）
         #[arg(short, long, default_value = "20")]
         closed: u32,
@@ -75,6 +77,15 @@ enum Commands {
         #[arg(short, long, default_value = "120")]
         interval: u64,
     },
+    /// 启动 REST API 服务器提供实时报告
+    Report {
+        /// 配置文件路径
+        #[arg(default_value = "config.json")]
+        config: String,
+        /// API 服务器端口
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -90,8 +101,8 @@ async fn main() -> Result<()> {
         Commands::Place { config } => {
             place_orders(&config).await?;
         }
-        Commands::Orders { config, all, closed } => {
-            show_open_orders(&config, all, closed).await?;
+        Commands::Orders { config, closed } => {
+            show_open_orders(&config, closed).await?;
         }
         Commands::Trades { config, limit } => {
             show_trades(&config, Some(limit)).await?;
@@ -102,9 +113,42 @@ async fn main() -> Result<()> {
         Commands::Watch { config, interval } => {
             watch_and_place(&config, interval).await?;
         }
+        Commands::Report { config, port } => {
+            api_server::start_server(config, port).await?;
+        }
     }
 
     Ok(())
+}
+
+/// 捕获账户快照（包含账户信息和当前价格）
+async fn capture_account_snapshot(
+    client: &Arc<dyn Exchange>,
+    exchange: &str,
+    symbol: &str,
+    mid_price: Option<f64>,
+    iteration: Option<u64>,
+) -> Result<AccountSnapshot> {
+    let account = client.get_account_info().await?;
+    let (base_asset, quote_asset) = client.get_symbol_assets(symbol);
+
+    let mut assets = Vec::new();
+    for balance in &account.balances {
+        if balance.asset == base_asset || balance.asset == quote_asset {
+            let free: f64 = balance.free.parse().unwrap_or(0.0);
+            let locked: f64 = balance.locked.parse().unwrap_or(0.0);
+            let total = free + locked;
+
+            assets.push(AssetSnapshot {
+                asset: balance.asset.clone(),
+                free,
+                locked,
+                total,
+            });
+        }
+    }
+
+    Ok(AccountSnapshot::new(exchange, symbol, assets, mid_price, iteration))
 }
 
 async fn show_account_info(client: &Arc<dyn Exchange>, symbol: &str) -> Result<()> {
@@ -147,6 +191,178 @@ async fn show_account_info(client: &Arc<dyn Exchange>, symbol: &str) -> Result<(
     Ok(())
 }
 
+async fn show_market_depth(client: &Arc<dyn Exchange>, symbol: &str) -> Result<()> {
+    // 获取订单簿（50档以获取足够深度）
+    let order_book = client.get_order_book(symbol, Some(50)).await?;
+
+    if order_book.bids.is_empty() || order_book.asks.is_empty() {
+        anyhow::bail!("Order book is empty");
+    }
+
+    // 获取最优买卖价
+    let best_bid: f64 = order_book.bids[0][0].parse().context("Failed to parse best bid")?;
+    let best_ask: f64 = order_book.asks[0][0].parse().context("Failed to parse best ask")?;
+    let mid_price = (best_bid + best_ask) / 2.0;
+
+    println!("\n╔════════════════════════════════════════════════════════╗");
+    println!("║                  MARKET DEPTH                          ║");
+    println!("╚════════════════════════════════════════════════════════╝");
+    println!("  Current Price: {:.6} (Bid: {:.6} | Ask: {:.6})", mid_price, best_bid, best_ask);
+    println!();
+
+    // 定义要统计的百分比范围
+    let percentages = vec![0.5, 1.0, 2.0, 5.0, 10.0];
+
+    println!("  {:<12} {:<20} {:<20}", "Range", "Bid Depth (USDT)", "Ask Depth (USDT)");
+    println!("  {}", "─".repeat(54));
+
+    for pct in percentages {
+        let bid_depth = calculate_depth_in_range(&order_book.bids, mid_price, pct, true)?;
+        let ask_depth = calculate_depth_in_range(&order_book.asks, mid_price, pct, false)?;
+
+        println!("  ±{:<10.1}% {:>18.2} {:>20.2}", pct, bid_depth, ask_depth);
+    }
+
+    println!("  {}", "─".repeat(54));
+    println!();
+
+    Ok(())
+}
+
+/// 显示订单深度统计（只显示深度，不显示具体订单列表）
+async fn show_order_depth_summary(client: &Arc<dyn Exchange>, symbol: &str) -> Result<()> {
+    let orders = client.get_open_orders(Some(symbol)).await?;
+
+    if orders.is_empty() {
+        println!("\n╔════════════════════════════════════════════════════════╗");
+        println!("║              MY ORDER DEPTH (NONE)                     ║");
+        println!("╚════════════════════════════════════════════════════════╝");
+        println!("  No open orders found.\n");
+        return Ok(());
+    }
+
+    // 统计买单和卖单
+    let buy_orders: Vec<_> = orders.iter().filter(|o| o.side == "BUY").collect();
+    let sell_orders: Vec<_> = orders.iter().filter(|o| o.side == "SELL").collect();
+
+    let mut total_buy_value = 0.0;
+    let mut total_buy_qty = 0.0;
+    let mut total_sell_value = 0.0;
+    let mut total_sell_qty = 0.0;
+
+    let mut buy_prices = Vec::new();
+    let mut sell_prices = Vec::new();
+
+    for order in &buy_orders {
+        let price: f64 = order.price.parse().unwrap_or(0.0);
+        let qty: f64 = order.orig_qty.parse().unwrap_or(0.0);
+        let filled: f64 = order.executed_qty.parse().unwrap_or(0.0);
+        let remaining_qty = qty - filled;
+
+        total_buy_value += price * remaining_qty;
+        total_buy_qty += remaining_qty;
+        buy_prices.push(price);
+    }
+
+    for order in &sell_orders {
+        let price: f64 = order.price.parse().unwrap_or(0.0);
+        let qty: f64 = order.orig_qty.parse().unwrap_or(0.0);
+        let filled: f64 = order.executed_qty.parse().unwrap_or(0.0);
+        let remaining_qty = qty - filled;
+
+        total_sell_value += price * remaining_qty;
+        total_sell_qty += remaining_qty;
+        sell_prices.push(price);
+    }
+
+    // 计算价格范围
+    let (buy_min, buy_max) = if !buy_prices.is_empty() {
+        let min = buy_prices.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max = buy_prices.iter().fold(0.0f64, |a, &b| a.max(b));
+        (Some(min), Some(max))
+    } else {
+        (None, None)
+    };
+
+    let (sell_min, sell_max) = if !sell_prices.is_empty() {
+        let min = sell_prices.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max = sell_prices.iter().fold(0.0f64, |a, &b| a.max(b));
+        (Some(min), Some(max))
+    } else {
+        (None, None)
+    };
+
+    println!("\n╔════════════════════════════════════════════════════════╗");
+    println!("║                MY ORDER DEPTH                          ║");
+    println!("╚════════════════════════════════════════════════════════╝");
+    println!("  Total Orders: {}", orders.len());
+    println!();
+
+    println!("  🟢 BUY Orders:");
+    println!("     Count:       {}", buy_orders.len());
+    if let (Some(min), Some(max)) = (buy_min, buy_max) {
+        println!("     Price Range: {:.6} - {:.6}", min, max);
+    }
+    println!("     Total Qty:   {:.5}", total_buy_qty);
+    println!("     Total Value: {:.2} USDT", total_buy_value);
+    println!();
+
+    println!("  🔴 SELL Orders:");
+    println!("     Count:       {}", sell_orders.len());
+    if let (Some(min), Some(max)) = (sell_min, sell_max) {
+        println!("     Price Range: {:.6} - {:.6}", min, max);
+    }
+    println!("     Total Qty:   {:.5}", total_sell_qty);
+    println!("     Total Value: {:.2} USDT", total_sell_value);
+    println!();
+
+    println!("  💰 Total Unfilled Value: {:.2} USDT", total_buy_value + total_sell_value);
+    println!();
+
+    Ok(())
+}
+
+/// 计算指定百分比范围内的订单簿深度（USDT）
+fn calculate_depth_in_range(
+    orders: &[Vec<String>],
+    mid_price: f64,
+    percentage: f64,
+    is_bid: bool,
+) -> Result<f64> {
+    let mut total_depth = 0.0;
+
+    // 计算价格范围
+    let price_threshold = if is_bid {
+        // 买单：从mid_price向下percentage%
+        mid_price * (1.0 - percentage / 100.0)
+    } else {
+        // 卖单：从mid_price向上percentage%
+        mid_price * (1.0 + percentage / 100.0)
+    };
+
+    for order in orders {
+        if order.len() < 2 {
+            continue;
+        }
+
+        let price: f64 = order[0].parse().context("Failed to parse price")?;
+        let quantity: f64 = order[1].parse().context("Failed to parse quantity")?;
+
+        // 判断是否在范围内
+        let in_range = if is_bid {
+            price >= price_threshold && price <= mid_price
+        } else {
+            price <= price_threshold && price >= mid_price
+        };
+
+        if in_range {
+            total_depth += price * quantity;
+        }
+    }
+
+    Ok(total_depth)
+}
+
 async fn watch_and_place(config_path: &str, interval: u64) -> Result<()> {
     println!("🔄 Starting continuous order placement mode");
     println!("📅 Interval: {} seconds ({} minutes)", interval, interval / 60);
@@ -164,7 +380,7 @@ async fn watch_and_place(config_path: &str, interval: u64) -> Result<()> {
         println!("╚════════════════════════════════════════════════════════╝\n");
 
         // 执行布单（自动模式，无需确认）
-        match place_orders_internal(config_path, true).await {
+        match place_orders_internal_with_iteration(config_path, true, Some(iteration)).await {
             Ok(_) => println!("\n✅ Iteration #{} completed successfully", iteration),
             Err(e) => println!("\n❌ Iteration #{} failed: {}", iteration, e),
         }
@@ -182,52 +398,117 @@ async fn place_orders(config_path: &str) -> Result<()> {
 }
 
 async fn place_orders_internal(config_path: &str, auto_mode: bool) -> Result<()> {
+    place_orders_internal_with_iteration(config_path, auto_mode, None).await
+}
+
+async fn place_orders_internal_with_iteration(
+    config_path: &str,
+    auto_mode: bool,
+    iteration: Option<u64>,
+) -> Result<()> {
     println!("Loading config from: {}", config_path);
     let config = Config::from_file(config_path)?;
 
+    println!("\n{}", "═".repeat(70));
+    println!("  Configured exchanges: {}", config.exchanges.len());
+    for (i, exchange) in config.exchanges.iter().enumerate() {
+        println!("    {}. {}", i + 1, exchange.name);
+    }
+    println!("{}", "═".repeat(70));
+
+    let mut all_success = true;
+
+    for (i, exchange_config) in config.exchanges.iter().enumerate() {
+        println!("\n\n╔═══════════════════════════════════════════════════════════════╗");
+        println!("║  Processing Exchange {}/{}: {:<37} ║", i + 1, config.exchanges.len(), exchange_config.name);
+        println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+        match place_orders_for_exchange(exchange_config, &config.grid, auto_mode, iteration).await {
+            Ok(_) => println!("\n✅ Successfully processed {}", exchange_config.name),
+            Err(e) => {
+                println!("\n❌ Failed to process {}: {}", exchange_config.name, e);
+                all_success = false;
+            }
+        }
+    }
+
+    if all_success {
+        println!("\n\n🎉 All exchanges processed successfully!");
+    } else {
+        println!("\n\n⚠️  Some exchanges failed. Please check the errors above.");
+    }
+
+    Ok(())
+}
+
+async fn place_orders_for_exchange(
+    exchange_config: &config::ExchangeConfig,
+    grid_config: &config::GridConfig,
+    auto_mode: bool,
+    iteration: Option<u64>,
+) -> Result<()> {
     // 解析交易所类型
-    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", config.exchange))
-        .context(format!("Invalid exchange type: {}", config.exchange))?;
+    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
+        .context(format!("Invalid exchange type: {}", exchange_config.name))?;
 
     println!("Exchange: {:?}", exchange_type);
 
     // 创建对应的交易所客户端
     let client = create_exchange(
         &exchange_type,
-        config.api_key.clone(),
-        config.api_secret.clone(),
-        config.api_passphrase.clone(),
+        exchange_config.api_key.clone(),
+        exchange_config.api_secret.clone(),
+        exchange_config.api_passphrase.clone(),
     )?;
 
     // 显示账户信息
-    show_account_info(&client, &config.grid.symbol).await?;
+    show_account_info(&client, &grid_config.symbol).await?;
 
-    println!("Fetching order book for {}...", config.grid.symbol);
+    println!("Fetching order book for {}...", grid_config.symbol);
 
-    // 获取订单簿的最优买卖价
-    let order_book = client.get_order_book(&config.grid.symbol, Some(1)).await?;
+    // 获取订单簿（根据配置的深度）
+    let order_book = client
+        .get_order_book(&grid_config.symbol, Some(grid_config.orderbook_depth))
+        .await?;
 
     if order_book.bids.is_empty() || order_book.asks.is_empty() {
         anyhow::bail!("Order book is empty, cannot calculate mid price");
     }
 
-    let highest_bid: f64 = order_book.bids[0][0]
-        .parse()
-        .context("Failed to parse highest bid")?;
+    // 如果 Bid 或 Ask 使用 VolumeThreshold 方法，需要获取历史订单
+    let all_orders = if matches!(grid_config.mid_price_method_bid, config::MidPriceMethod::VolumeThreshold)
+        || matches!(grid_config.mid_price_method_ask, config::MidPriceMethod::VolumeThreshold)
+    {
+        println!("Fetching order history to calculate filled buy orders value...");
+        match client.get_all_orders(&grid_config.symbol, Some(500)).await {
+            Ok(orders) => Some(orders),
+            Err(e) => {
+                println!("⚠️  Warning: Failed to fetch order history: {}. Using default threshold.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    let lowest_ask: f64 = order_book.asks[0][0]
-        .parse()
-        .context("Failed to parse lowest ask")?;
+    // 使用 PriceCalculator 分别计算 bid 和 ask 价格
+    let price_result = PriceCalculator::calculate_mid_price(
+        &order_book,
+        &grid_config.mid_price_method_bid,
+        &grid_config.mid_price_method_ask,
+        all_orders.as_deref(),
+        grid_config.volume_threshold_usdt,
+    )?;
 
-    let current_price = (highest_bid + lowest_ask) / 2.0;
+    let current_price = price_result.mid_price;
 
-    println!("📊 Order Book:");
-    println!("  Highest Bid: {:.6}", highest_bid);
-    println!("  Lowest Ask:  {:.6}", lowest_ask);
-    println!("  Mid Price:   {:.6}", current_price);
+    println!("\n📊 Price Calculation:");
+    println!("  Methods: {}", price_result.method_description);
+    println!("{}", price_result.details);
+    println!("  => Mid Price: {:.6}", current_price);
 
-    // 读取上次布单的状态
-    let state_file = format!(".state_{}.json", config.grid.symbol);
+    // 读取上次布单的状态（为每个交易所单独保存状态）
+    let state_file = format!(".state_{}_{}.json", exchange_config.name, grid_config.symbol);
     let last_state = TradingState::load(&state_file)?;
 
     if let Some(state) = &last_state {
@@ -244,7 +525,7 @@ async fn place_orders_internal(config_path: &str, auto_mode: bool) -> Result<()>
             println!("📉 Current: {:.6} < Last: {:.6}", current_price, state.last_price);
             println!("\n🗑️  Canceling all BUY orders...");
 
-            let all_orders = client.get_open_orders(Some(&config.grid.symbol)).await?;
+            let all_orders = client.get_open_orders(Some(&grid_config.symbol)).await?;
             let buy_orders: Vec<_> = all_orders.iter().filter(|o| o.side == "BUY").collect();
 
             if !buy_orders.is_empty() {
@@ -279,11 +560,11 @@ async fn place_orders_internal(config_path: &str, auto_mode: bool) -> Result<()>
     }
 
     println!("\n📋 Calculating grid orders...");
-    let mut orders = OrderCalculator::calculate_grid_orders(current_price, &config.grid);
+    let mut orders = OrderCalculator::calculate_grid_orders(current_price, grid_config);
 
     // 获取现有挂单
     println!("\n🔍 Checking existing orders...");
-    let existing_orders = client.get_open_orders(Some(&config.grid.symbol)).await?;
+    let existing_orders = client.get_open_orders(Some(&grid_config.symbol)).await?;
 
     if !existing_orders.is_empty() {
         println!("Found {} existing orders", existing_orders.len());
@@ -364,24 +645,24 @@ async fn place_orders_internal(config_path: &str, auto_mode: bool) -> Result<()>
             println!("  Existing sell orders total value: {:.2} USDT", existing_sell_value);
 
             // 调整配置的总价值
-            let mut adjusted_config = config.grid.clone();
-            let remaining_buy_value = (config.grid.total_buy_value - existing_buy_value).max(0.0);
-            let remaining_sell_value = (config.grid.total_sell_value - existing_sell_value).max(0.0);
+            let mut adjusted_config = grid_config.clone();
+            let remaining_buy_value = (grid_config.total_buy_value - existing_buy_value).max(0.0);
+            let remaining_sell_value = (grid_config.total_sell_value - existing_sell_value).max(0.0);
 
             // 如果调整后的价值小于最小订单价值，设置为 0（不布单）
-            if remaining_buy_value < config.grid.minimal_order_value {
+            if remaining_buy_value < grid_config.minimal_order_value {
                 adjusted_config.total_buy_value = 0.0;
                 println!("  Adjusted buy value {:.2} USDT < minimal {:.2} USDT, skipping buy orders",
-                         remaining_buy_value, config.grid.minimal_order_value);
+                         remaining_buy_value, grid_config.minimal_order_value);
             } else {
                 adjusted_config.total_buy_value = remaining_buy_value;
                 println!("  Adjusted buy value for new orders: {:.2} USDT", adjusted_config.total_buy_value);
             }
 
-            if remaining_sell_value < config.grid.minimal_order_value {
+            if remaining_sell_value < grid_config.minimal_order_value {
                 adjusted_config.total_sell_value = 0.0;
                 println!("  Adjusted sell value {:.2} USDT < minimal {:.2} USDT, skipping sell orders",
-                         remaining_sell_value, config.grid.minimal_order_value);
+                         remaining_sell_value, grid_config.minimal_order_value);
             } else {
                 adjusted_config.total_sell_value = remaining_sell_value;
                 println!("  Adjusted sell value for new orders: {:.2} USDT", adjusted_config.total_sell_value);
@@ -512,7 +793,7 @@ async fn place_orders_internal(config_path: &str, auto_mode: bool) -> Result<()>
     let batch_orders: Vec<exchange::BatchOrder> = orders
         .iter()
         .map(|order| exchange::BatchOrder {
-            symbol: config.grid.symbol.clone(),
+            symbol: grid_config.symbol.clone(),
             side: order.side.clone(),
             quantity: order.quantity,
             price: order.price,
@@ -568,7 +849,7 @@ async fn place_orders_internal(config_path: &str, auto_mode: bool) -> Result<()>
 
     // 保存当前价格状态
     if successful > 0 {
-        let new_state = TradingState::new(config.grid.symbol.clone(), current_price);
+        let new_state = TradingState::new(grid_config.symbol.clone(), current_price);
         if let Err(e) = new_state.save(&state_file) {
             println!("\n⚠️  Warning: Failed to save state: {}", e);
         } else {
@@ -576,29 +857,95 @@ async fn place_orders_internal(config_path: &str, auto_mode: bool) -> Result<()>
         }
     }
 
+    // 记录账户快照（无论布单是否成功都记录）
+    println!("\n📸 Capturing account snapshot...");
+    match capture_account_snapshot(&client, &exchange_config.name, &grid_config.symbol, Some(current_price), iteration).await {
+        Ok(snapshot) => {
+            let history = SnapshotHistory::new(&exchange_config.name, &grid_config.symbol);
+            match history.append_snapshot(&snapshot) {
+                Ok(_) => {
+                    println!("✅ Account snapshot saved");
+
+                    // 如果有之前的快照，计算并显示盈亏
+                    if let Ok(Some(previous)) = history.load_latest().and_then(|_latest| {
+                        // 获取倒数第二个快照
+                        let all = history.load_all()?;
+                        if all.len() >= 2 {
+                            Ok(Some(all[all.len() - 2].clone()))
+                        } else {
+                            Ok(None)
+                        }
+                    }) {
+                        let (base_asset, quote_asset) = client.get_symbol_assets(&grid_config.symbol);
+                        let report = PnLAnalyzer::analyze_change(&previous, &snapshot, &base_asset, &quote_asset);
+
+                        if let Some(vc) = &report.value_change {
+                            let icon = if vc.change >= 0.0 { "📈" } else { "📉" };
+                            println!("   {} Change since last snapshot: {:+.2} {} ({:+.3}%)",
+                                     icon, vc.change, quote_asset, vc.change_percentage);
+                        }
+                    }
+                },
+                Err(e) => println!("⚠️  Warning: Failed to save snapshot: {}", e),
+            }
+        },
+        Err(e) => println!("⚠️  Warning: Failed to capture snapshot: {}", e),
+    }
+
     Ok(())
 }
 
-async fn show_open_orders(config_path: &str, all: bool, closed: u32) -> Result<()> {
+async fn show_open_orders(config_path: &str, closed: u32) -> Result<()> {
     let config = Config::from_file(config_path)?;
 
-    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", config.exchange))
-        .context(format!("Invalid exchange type: {}", config.exchange))?;
+    println!("\n{}", "═".repeat(70));
+    println!("  Configured exchanges: {}", config.exchanges.len());
+    for (i, exchange) in config.exchanges.iter().enumerate() {
+        println!("    {}. {}", i + 1, exchange.name);
+    }
+    println!("{}", "═".repeat(70));
+
+    for (i, exchange_config) in config.exchanges.iter().enumerate() {
+        println!("\n\n╔═══════════════════════════════════════════════════════════════╗");
+        println!("║  Exchange {}/{}: {:<45} ║", i + 1, config.exchanges.len(), exchange_config.name);
+        println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+        match show_orders_for_exchange(exchange_config, &config.grid, closed).await {
+            Ok(_) => {},
+            Err(e) => println!("\n❌ Failed to fetch orders from {}: {}", exchange_config.name, e),
+        }
+    }
+
+    Ok(())
+}
+
+async fn show_orders_for_exchange(
+    exchange_config: &config::ExchangeConfig,
+    grid_config: &config::GridConfig,
+    closed: u32,
+) -> Result<()> {
+    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
+        .context(format!("Invalid exchange type: {}", exchange_config.name))?;
 
     let client = create_exchange(
         &exchange_type,
-        config.api_key.clone(),
-        config.api_secret.clone(),
-        config.api_passphrase.clone(),
+        exchange_config.api_key.clone(),
+        exchange_config.api_secret.clone(),
+        exchange_config.api_passphrase.clone(),
     )?;
 
     // 显示账户信息
-    show_account_info(&client, &config.grid.symbol).await?;
+    show_account_info(&client, &grid_config.symbol).await?;
 
-    let symbol = if all { None } else { Some(config.grid.symbol.as_str()) };
+    // 获取并显示市场深度
+    println!("\nFetching market depth...");
+    if let Err(e) = show_market_depth(&client, &grid_config.symbol).await {
+        println!("⚠️  Warning: Failed to fetch market depth: {}", e);
+    }
 
-    println!("Fetching open orders...");
-    let orders = client.get_open_orders(symbol).await?;
+    // 只查询配置文件中指定的交易对
+    println!("\nFetching open orders for {}...", grid_config.symbol);
+    let orders = client.get_open_orders(Some(&grid_config.symbol)).await?;
 
     if orders.is_empty() {
         println!("No open orders found.");
@@ -634,7 +981,7 @@ async fn show_open_orders(config_path: &str, all: bool, closed: u32) -> Result<(
     if closed > 0 {
         let limit = closed;
         println!("\n\nFetching recently closed orders...");
-        let all_orders = client.get_all_orders(&config.grid.symbol, Some(limit + 100)).await?;
+        let all_orders = client.get_all_orders(&grid_config.symbol, Some(limit + 100)).await?;
 
         // 筛选出已关闭的订单
         let closed_orders: Vec<_> = all_orders
@@ -683,21 +1030,47 @@ async fn show_open_orders(config_path: &str, all: bool, closed: u32) -> Result<(
 async fn cancel_all_orders(config_path: &str, force: bool) -> Result<()> {
     let config = Config::from_file(config_path)?;
 
-    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", config.exchange))
-        .context(format!("Invalid exchange type: {}", config.exchange))?;
+    println!("\n{}", "═".repeat(70));
+    println!("  Configured exchanges: {}", config.exchanges.len());
+    for (i, exchange) in config.exchanges.iter().enumerate() {
+        println!("    {}. {}", i + 1, exchange.name);
+    }
+    println!("{}", "═".repeat(70));
+
+    for (i, exchange_config) in config.exchanges.iter().enumerate() {
+        println!("\n\n╔═══════════════════════════════════════════════════════════════╗");
+        println!("║  Exchange {}/{}: {:<45} ║", i + 1, config.exchanges.len(), exchange_config.name);
+        println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+        match cancel_orders_for_exchange(exchange_config, &config.grid, force).await {
+            Ok(_) => {},
+            Err(e) => println!("\n❌ Failed to cancel orders on {}: {}", exchange_config.name, e),
+        }
+    }
+
+    Ok(())
+}
+
+async fn cancel_orders_for_exchange(
+    exchange_config: &config::ExchangeConfig,
+    grid_config: &config::GridConfig,
+    force: bool,
+) -> Result<()> {
+    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
+        .context(format!("Invalid exchange type: {}", exchange_config.name))?;
 
     let client = create_exchange(
         &exchange_type,
-        config.api_key.clone(),
-        config.api_secret.clone(),
-        config.api_passphrase.clone(),
+        exchange_config.api_key.clone(),
+        exchange_config.api_secret.clone(),
+        exchange_config.api_passphrase.clone(),
     )?;
 
     // 显示账户信息
-    show_account_info(&client, &config.grid.symbol).await?;
+    show_account_info(&client, &grid_config.symbol).await?;
 
     println!("Fetching open orders...");
-    let orders = client.get_open_orders(Some(&config.grid.symbol)).await?;
+    let orders = client.get_open_orders(Some(&grid_config.symbol)).await?;
 
     if orders.is_empty() {
         println!("✅ No open orders to cancel.");
@@ -788,24 +1161,203 @@ async fn cancel_all_orders(config_path: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-async fn show_trades(config_path: &str, limit: Option<u32>) -> Result<()> {
-    let config = Config::from_file(config_path)?;
+async fn show_pnl_report(config_path: &str, recent: usize) -> Result<()> {
+    println!("🔄 Starting report mode with 30-second refresh");
+    println!("⚠️  Press Ctrl+C to stop\n");
+    println!("{}", "═".repeat(60));
 
-    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", config.exchange))
-        .context(format!("Invalid exchange type: {}", config.exchange))?;
+    loop {
+        // 清屏（可选，如果终端支持）
+        print!("\x1B[2J\x1B[1;1H");
+
+        let now = chrono::Utc::now();
+        println!("\n╔════════════════════════════════════════════════════════╗");
+        println!("║  Report Time: {:<39} ║", now.format("%Y-%m-%d %H:%M:%S UTC"));
+        println!("╚════════════════════════════════════════════════════════╝\n");
+
+        let config = Config::from_file(config_path)?;
+
+        println!("{}", "═".repeat(70));
+        println!("  Configured exchanges: {}", config.exchanges.len());
+        for (i, exchange) in config.exchanges.iter().enumerate() {
+            println!("    {}. {}", i + 1, exchange.name);
+        }
+        println!("{}", "═".repeat(70));
+
+        for (i, exchange_config) in config.exchanges.iter().enumerate() {
+            println!("\n\n╔═══════════════════════════════════════════════════════════════╗");
+            println!("║  Exchange {}/{}: {:<45} ║", i + 1, config.exchanges.len(), exchange_config.name);
+            println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+            match show_pnl_report_for_exchange(exchange_config, &config.grid, recent).await {
+                Ok(_) => {},
+                Err(e) => println!("\n❌ Failed to generate report for {}: {}", exchange_config.name, e),
+            }
+        }
+
+        println!("\n⏳ Next refresh in 30 seconds...");
+        println!("   Next update at: {}", (now + chrono::Duration::seconds(30)).format("%H:%M:%S UTC"));
+        println!("{}", "═".repeat(60));
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+    }
+}
+
+async fn show_pnl_report_for_exchange(
+    exchange_config: &config::ExchangeConfig,
+    grid_config: &config::GridConfig,
+    recent: usize,
+) -> Result<()> {
+    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
+        .context(format!("Invalid exchange type: {}", exchange_config.name))?;
 
     let client = create_exchange(
         &exchange_type,
-        config.api_key.clone(),
-        config.api_secret.clone(),
-        config.api_passphrase.clone(),
+        exchange_config.api_key.clone(),
+        exchange_config.api_secret.clone(),
+        exchange_config.api_passphrase.clone(),
+    )?;
+
+    let (base_asset, quote_asset) = client.get_symbol_assets(&grid_config.symbol);
+
+    // 显示账户信息
+    show_account_info(&client, &grid_config.symbol).await?;
+
+    // 显示市场深度
+    if let Err(e) = show_market_depth(&client, &grid_config.symbol).await {
+        println!("⚠️  Warning: Failed to fetch market depth: {}", e);
+    }
+
+    // 显示订单深度统计（不显示具体订单列表）
+    if let Err(e) = show_order_depth_summary(&client, &grid_config.symbol).await {
+        println!("⚠️  Warning: Failed to fetch order depth: {}", e);
+    }
+
+    // 加载快照历史
+    let history = SnapshotHistory::new(&exchange_config.name, &grid_config.symbol);
+    let snapshots = history.load_all()?;
+
+    if snapshots.is_empty() {
+        println!("No snapshots found. Start using watch mode to collect account data.");
+        return Ok(());
+    }
+
+    println!("📊 Found {} snapshots in history\n", snapshots.len());
+
+    // 显示最新的账户状态
+    if let Some(latest) = snapshots.last() {
+        println!("╔════════════════════════════════════════════════════════╗");
+        println!("║              LATEST ACCOUNT STATUS                     ║");
+        println!("╚════════════════════════════════════════════════════════╝");
+        println!("\n📅 Timestamp: {}", latest.datetime);
+        if let Some(iter) = latest.iteration {
+            println!("🔄 Iteration: #{}", iter);
+        }
+        if let Some(price) = latest.mid_price {
+            println!("💹 Mid Price: {:.6}", price);
+        }
+
+        println!("\n🪙 Assets:");
+        for asset in &latest.assets {
+            println!("  {} {:<8}  Free: {:>15.8}  Locked: {:>15.8}  Total: {:>15.8}",
+                     if asset.asset == base_asset { "🪙" } else { "💵" },
+                     asset.asset,
+                     asset.free,
+                     asset.locked,
+                     asset.total);
+        }
+
+        if let Some(total_value) = latest.calculate_total_value(&base_asset, &quote_asset) {
+            println!("\n💰 Total Value: {:.2} {}", total_value, quote_asset);
+        }
+
+        println!("════════════════════════════════════════════════════════\n");
+    }
+
+    // 如果有多个快照，分析整体表现
+    if snapshots.len() >= 2 {
+        if let Some(analysis) = PnLAnalyzer::analyze_period(&snapshots, &base_asset, &quote_asset) {
+            analysis.print_detailed_report(&base_asset, &quote_asset);
+        }
+
+        // 显示最近 N 个快照的详细变化
+        let display_count = recent.min(snapshots.len());
+        let recent_snapshots = &snapshots[snapshots.len() - display_count..];
+
+        println!("\n╔════════════════════════════════════════════════════════╗");
+        println!("║          RECENT {} SNAPSHOTS DETAILS                    ║", display_count);
+        println!("╚════════════════════════════════════════════════════════╝\n");
+
+        for snapshot in recent_snapshots {
+            println!("📸 {}", snapshot.datetime);
+            if let Some(iter) = snapshot.iteration {
+                println!("   Iteration: #{}", iter);
+            }
+            if let Some(price) = snapshot.mid_price {
+                println!("   Mid Price: {:.6}", price);
+            }
+            if let Some(total_value) = snapshot.calculate_total_value(&base_asset, &quote_asset) {
+                println!("   Total Value: {:.2} {}", total_value, quote_asset);
+            }
+            for asset in &snapshot.assets {
+                println!("   {} {:<8} Total: {:>15.8}",
+                         if asset.asset == base_asset { "🪙" } else { "💵" },
+                         asset.asset,
+                         asset.total);
+            }
+            println!();
+        }
+    } else {
+        println!("Not enough snapshots for analysis. Keep running watch mode to collect more data.");
+    }
+
+    Ok(())
+}
+
+async fn show_trades(config_path: &str, limit: Option<u32>) -> Result<()> {
+    let config = Config::from_file(config_path)?;
+
+    println!("\n{}", "═".repeat(70));
+    println!("  Configured exchanges: {}", config.exchanges.len());
+    for (i, exchange) in config.exchanges.iter().enumerate() {
+        println!("    {}. {}", i + 1, exchange.name);
+    }
+    println!("{}", "═".repeat(70));
+
+    for (i, exchange_config) in config.exchanges.iter().enumerate() {
+        println!("\n\n╔═══════════════════════════════════════════════════════════════╗");
+        println!("║  Exchange {}/{}: {:<45} ║", i + 1, config.exchanges.len(), exchange_config.name);
+        println!("╚═══════════════════════════════════════════════════════════════╝\n");
+
+        match show_trades_for_exchange(exchange_config, &config.grid, limit).await {
+            Ok(_) => {},
+            Err(e) => println!("\n❌ Failed to fetch trades from {}: {}", exchange_config.name, e),
+        }
+    }
+
+    Ok(())
+}
+
+async fn show_trades_for_exchange(
+    exchange_config: &config::ExchangeConfig,
+    grid_config: &config::GridConfig,
+    limit: Option<u32>,
+) -> Result<()> {
+    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
+        .context(format!("Invalid exchange type: {}", exchange_config.name))?;
+
+    let client = create_exchange(
+        &exchange_type,
+        exchange_config.api_key.clone(),
+        exchange_config.api_secret.clone(),
+        exchange_config.api_passphrase.clone(),
     )?;
 
     // 显示账户信息
-    show_account_info(&client, &config.grid.symbol).await?;
+    show_account_info(&client, &grid_config.symbol).await?;
 
-    println!("Fetching trades for {}...", config.grid.symbol);
-    let trades = client.get_my_trades(&config.grid.symbol, limit).await?;
+    println!("Fetching trades for {}...", grid_config.symbol);
+    let trades = client.get_my_trades(&grid_config.symbol, limit).await?;
 
     if trades.is_empty() {
         println!("No trades found.");
