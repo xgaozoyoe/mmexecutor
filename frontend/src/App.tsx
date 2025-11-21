@@ -106,6 +106,7 @@ function App() {
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const [activeTab, setActiveTab] = useState<number>(0);
 
   const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:3000';
 
@@ -160,8 +161,30 @@ function App() {
         </div>
       </header>
 
-      {reportData?.exchanges.map((exchange) => (
-        <div key={exchange.name} className="exchange-section">
+      {/* Exchange Tabs */}
+      {reportData && reportData.exchanges.length > 1 && (
+        <div className="tabs-container">
+          <div className="tabs">
+            {reportData.exchanges.map((exchange, index) => (
+              <button
+                key={exchange.name}
+                className={`tab ${activeTab === index ? 'active' : ''}`}
+                onClick={() => setActiveTab(index)}
+              >
+                {exchange.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Active Exchange Content */}
+      {reportData?.exchanges.map((exchange, index) => (
+        <div
+          key={exchange.name}
+          className="exchange-section"
+          style={{ display: activeTab === index ? 'block' : 'none' }}
+        >
           <h2 className="exchange-name">📊 {exchange.name}</h2>
 
           {/* Account Info */}
