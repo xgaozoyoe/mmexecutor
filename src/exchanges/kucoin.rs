@@ -158,10 +158,6 @@ impl Exchange for KucoinExchange {
         let kucoin_response: serde_json::Value = response.json().await?;
 
         // KuCoin returns wrapped response: {"code":"200000","data":[{"id":"xxx","currency":"BTC","type":"trade","balance":"1.0","available":"1.0","holds":"0"}]}
-
-        // Log the actual response for debugging
-        eprintln!("DEBUG: KuCoin account info response: {}", serde_json::to_string_pretty(&kucoin_response).unwrap_or_else(|_| "Failed to serialize".to_string()));
-
         if let Some(data) = kucoin_response.get("data") {
             let kucoin_balances: Vec<serde_json::Value> = serde_json::from_value(data.clone())
                 .context("Failed to parse KuCoin account data")?;
