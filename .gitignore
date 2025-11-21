@@ -36,3 +36,4 @@ Thumbs.db
 
 # Logs
 *.log
+.account_snapshots_*.jsonl

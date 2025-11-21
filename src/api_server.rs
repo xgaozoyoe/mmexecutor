@@ -157,11 +157,13 @@ pub async fn start_server(config_path: String, port: u16) -> Result<()> {
         cache: Arc::new(RwLock::new(None)),
     };
 
-    // Start background task to update cache every 30 seconds
+    // Start background task to update cache and capture snapshots every 30 seconds
     let cache_state = state.clone();
     tokio::spawn(async move {
+        let mut iteration_counter = 0u64;
         loop {
-            match fetch_report_data(&cache_state.config_path).await {
+            iteration_counter += 1;
+            match fetch_and_snapshot_report_data(&cache_state.config_path, Some(iteration_counter)).await {
                 Ok(data) => {
                     let mut cache = cache_state.cache.write().await;
                     *cache = Some(data);
@@ -222,11 +224,15 @@ async fn get_report(State(state): State<AppState>) -> Result<Json<ReportData>, A
 }
 
 async fn fetch_report_data(config_path: &str) -> Result<ReportData> {
+    fetch_and_snapshot_report_data(config_path, None).await
+}
+
+async fn fetch_and_snapshot_report_data(config_path: &str, iteration: Option<u64>) -> Result<ReportData> {
     let config = Config::from_file(config_path)?;
     let mut exchanges = Vec::new();
 
     for exchange_config in &config.exchanges {
-        match fetch_exchange_report(exchange_config, &config.grid).await {
+        match fetch_exchange_report_with_snapshot(exchange_config, &config.grid, iteration).await {
             Ok(report) => exchanges.push(report),
             Err(e) => {
                 eprintln!("Warning: Failed to fetch report for {}: {}", exchange_config.name, e);
@@ -243,6 +249,14 @@ async fn fetch_report_data(config_path: &str) -> Result<ReportData> {
 async fn fetch_exchange_report(
     exchange_config: &crate::config::ExchangeConfig,
     grid_config: &crate::config::GridConfig,
+) -> Result<ExchangeReport> {
+    fetch_exchange_report_with_snapshot(exchange_config, grid_config, None).await
+}
+
+async fn fetch_exchange_report_with_snapshot(
+    exchange_config: &crate::config::ExchangeConfig,
+    grid_config: &crate::config::GridConfig,
+    iteration: Option<u64>,
 ) -> Result<ExchangeReport> {
     let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
         .context(format!("Invalid exchange type: {}", exchange_config.name))?;
@@ -270,6 +284,25 @@ async fn fetch_exchange_report(
 
     // Fetch PnL summary
     let pnl_summary = fetch_pnl_summary(&exchange_config.name, &grid_config.symbol, &base_asset, &quote_asset)?;
+
+    // Capture and save snapshot if iteration is provided
+    if iteration.is_some() {
+        match capture_and_save_snapshot(
+            &client,
+            &exchange_config.name,
+            &grid_config.symbol,
+            Some(market_depth.current_price),
+            iteration,
+        ).await {
+            Ok(_) => {
+                // Snapshot saved successfully - silently continue
+            }
+            Err(e) => {
+                // Log error but don't fail the entire report
+                eprintln!("Warning: Failed to save snapshot for {}: {}", exchange_config.name, e);
+            }
+        }
+    }
 
     Ok(ExchangeReport {
         name: exchange_config.name.clone(),
@@ -553,6 +586,44 @@ fn fetch_snapshots_info(
         total_count: snapshots.len(),
         latest,
     })
+}
+
+async fn capture_and_save_snapshot(
+    client: &Arc<dyn Exchange>,
+    exchange: &str,
+    symbol: &str,
+    mid_price: Option<f64>,
+    iteration: Option<u64>,
+) -> Result<()> {
+    // Get account info
+    let account = client.get_account_info().await?;
+    let (base_asset, quote_asset) = client.get_symbol_assets(symbol);
+
+    // Build asset snapshots
+    let mut assets = Vec::new();
+    for balance in &account.balances {
+        if balance.asset == base_asset || balance.asset == quote_asset {
+            let free: f64 = balance.free.parse().unwrap_or(0.0);
+            let locked: f64 = balance.locked.parse().unwrap_or(0.0);
+            let total = free + locked;
+
+            assets.push(AssetSnapshot {
+                asset: balance.asset.clone(),
+                free,
+                locked,
+                total,
+            });
+        }
+    }
+
+    // Create snapshot
+    let snapshot = AccountSnapshot::new(exchange, symbol, assets, mid_price, iteration);
+
+    // Save to history
+    let history = SnapshotHistory::new(exchange, symbol);
+    history.append_snapshot(&snapshot)?;
+
+    Ok(())
 }
 
 fn fetch_pnl_summary(

@@ -158,6 +158,22 @@ The `/api/report` endpoint returns JSON data in the following format:
 }
 ```
 
+## Key Features
+
+### 🆕 Automatic Snapshot Generation (NEW!)
+The `report` command now automatically captures account snapshots every 30 seconds, just like the `watch` command. This means:
+- ✅ **No need to run `watch` separately** - snapshots are generated while running `report`
+- ✅ **Local data collection** - perfect for running report on your local machine while watch runs on server
+- ✅ **Real-time PnL tracking** - see profit/loss calculations as data accumulates
+- ✅ **Average price analysis** - get trading performance insights after 2+ snapshots
+- ✅ **Independent operation** - your server's `watch` data and local `report` data are stored separately
+
+**How it works:**
+- Every 30 seconds, the backend automatically saves a snapshot of your account balances
+- Snapshots are saved to `.snapshots_{exchange}_{symbol}.jsonl` files
+- After 2+ snapshots with balance changes, you'll see PnL summary and average trading price
+- Each exchange's snapshots are stored separately
+
 ## Dashboard Features
 
 The React dashboard displays:
