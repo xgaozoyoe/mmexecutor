@@ -98,7 +98,69 @@ impl Exchange for GateExchange {
         quantity: f64,
         price: f64,
     ) -> Result<OrderResponse> {
-        anyhow::bail!("Gate.io implementation not yet complete - place_limit_order")
+        let timestamp = Self::get_timestamp();
+
+        // Gate.io uses format: BTC_USDT
+        let gate_symbol = symbol.replace("USDT", "_USDT")
+            .replace("USDC", "_USDC")
+            .replace("BTC", "_BTC")
+            .replace("ETH", "_ETH");
+
+        // Generate unique client order ID
+        let client_order_id = format!("t-grid{}", timestamp);
+
+        let body_json = serde_json::json!({
+            "text": client_order_id,
+            "currency_pair": gate_symbol,
+            "type": "limit",
+            "account": "spot",
+            "side": side.to_lowercase(),
+            "amount": quantity.to_string(),
+            "price": price.to_string(),
+            "time_in_force": "gtc"
+        });
+
+        let body = serde_json::to_string(&body_json)?;
+        let body_hash = format!("{:x}", sha2::Sha512::digest(body.as_bytes()));
+
+        let url_path = "/api/v4/spot/orders";
+        let signature = self.generate_signature("POST", url_path, "", &body_hash, timestamp);
+
+        let url = format!("{}{}", BASE_URL, url_path);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("KEY", &self.api_key)
+            .header("Timestamp", timestamp.to_string())
+            .header("SIGN", signature)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .context("Failed to place Gate.io order")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Gate.io order failed: {}", error_text);
+        }
+
+        let response_text = response.text().await?;
+        let gate_response: serde_json::Value = serde_json::from_str(&response_text)
+            .context(format!("Failed to parse Gate.io response: {}", response_text))?;
+
+        // Gate.io returns order details directly
+        Ok(OrderResponse {
+            symbol: symbol.to_string(),
+            order_id: gate_response["id"].as_str().unwrap_or("").to_string(),
+            order_list_id: 0,
+            price: gate_response["price"].as_str().unwrap_or(&price.to_string()).to_string(),
+            orig_qty: gate_response["amount"].as_str().unwrap_or(&quantity.to_string()).to_string(),
+            order_type: "LIMIT".to_string(),
+            stp_mode: "".to_string(),
+            side: side.to_uppercase(),
+            transact_time: gate_response["create_time"].as_i64().unwrap_or(timestamp as i64),
+        })
     }
 
     async fn get_account_info(&self) -> Result<AccountInfo> {

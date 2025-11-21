@@ -637,25 +637,35 @@ async fn place_unified_orders_for_exchange(
         std::io::stdin().read_line(&mut String::new())?;
     }
 
-    // Place unified orders
-    println!("\n📝 Placing {} unified orders...", unified_orders.len());
+    // Place unified orders using batch API
+    println!("\n📝 Placing {} unified orders using batch API...", unified_orders.len());
+
+    // Convert GridOrder to BatchOrder
+    let batch_orders: Vec<crate::exchange::BatchOrder> = unified_orders.iter()
+        .map(|order| crate::exchange::BatchOrder {
+            symbol: grid_config.symbol.clone(),
+            side: order.side.clone(),
+            quantity: order.quantity,
+            price: order.price,
+        })
+        .collect();
+
+    // Use batch order placement
+    let results = client.place_batch_limit_orders(batch_orders).await?;
+
+    // Count successes and failures
     let mut success_count = 0;
     let mut fail_count = 0;
 
-    for (i, order) in unified_orders.iter().enumerate() {
+    for (i, result) in results.iter().enumerate() {
+        let order = &unified_orders[i];
         print!("  [{}/{}] {} {} @ {:.8} (qty: {:.5}) ... ",
             i + 1, unified_orders.len(),
             order.side, grid_config.symbol,
             order.price, order.quantity
         );
 
-        // Attempt to place the order
-        match client.place_limit_order(
-            &grid_config.symbol,
-            &order.side,
-            order.quantity,
-            order.price,
-        ).await {
+        match result {
             Ok(response) => {
                 println!("✅ Order ID: {}", response.order_id);
                 success_count += 1;
@@ -665,9 +675,6 @@ async fn place_unified_orders_for_exchange(
                 fail_count += 1;
             }
         }
-
-        // Small delay between orders to avoid rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     println!("\n📊 Order placement summary:");
