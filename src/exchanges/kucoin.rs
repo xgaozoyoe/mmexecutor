@@ -127,7 +127,86 @@ impl Exchange for KucoinExchange {
         quantity: f64,
         price: f64,
     ) -> Result<OrderResponse> {
-        anyhow::bail!("KuCoin implementation not yet complete - place_limit_order")
+        let timestamp = Self::get_timestamp();
+
+        // KuCoin uses format: BTC-USDT
+        let kucoin_symbol = if symbol.ends_with("USDT") {
+            symbol.replace("USDT", "-USDT")
+        } else if symbol.ends_with("USDC") {
+            symbol.replace("USDC", "-USDC")
+        } else if symbol.ends_with("BTC") {
+            symbol.replace("BTC", "-BTC")
+        } else if symbol.ends_with("ETH") {
+            symbol.replace("ETH", "-ETH")
+        } else {
+            symbol.to_string()
+        };
+
+        // Round price to 5 decimal places (priceIncrement = 0.00001)
+        let rounded_price = (price * 100000.0).round() / 100000.0;
+        // Round quantity to 1 decimal place (baseIncrement = 0.1)
+        let rounded_quantity = (quantity * 10.0).round() / 10.0;
+
+        let body_json = serde_json::json!({
+            "clientOid": format!("{}", uuid::Uuid::new_v4()),
+            "symbol": kucoin_symbol,
+            "type": "limit",
+            "side": side.to_lowercase(),
+            "price": format!("{:.5}", rounded_price),
+            "size": format!("{:.1}", rounded_quantity),
+        });
+
+        let body = serde_json::to_string(&body_json)?;
+        let endpoint = "/api/v1/hf/orders";
+
+        let signature = self.generate_signature(timestamp, "POST", endpoint, &body);
+        let passphrase_signature = self.generate_passphrase_signature();
+
+        let url = format!("{}{}", BASE_URL, endpoint);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("KC-API-KEY", &self.api_key)
+            .header("KC-API-SIGN", signature)
+            .header("KC-API-TIMESTAMP", timestamp.to_string())
+            .header("KC-API-PASSPHRASE", passphrase_signature)
+            .header("KC-API-KEY-VERSION", "2")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .context("Failed to place KuCoin order")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("KuCoin order failed: {}", error_text);
+        }
+
+        let response_text = response.text().await?;
+        let kucoin_response: serde_json::Value = serde_json::from_str(&response_text)
+            .context(format!("Failed to parse KuCoin response: {}", response_text))?;
+
+        // KuCoin HF API returns: {"code":"200000","data":{"orderId":"..."}}
+        if let Some(data) = kucoin_response.get("data") {
+            if let Some(order_id) = data.get("orderId").and_then(|id| id.as_str()) {
+                Ok(OrderResponse {
+                    symbol: symbol.to_string(),
+                    order_id: order_id.to_string(),
+                    order_list_id: 0,
+                    price: price.to_string(),
+                    orig_qty: quantity.to_string(),
+                    order_type: "LIMIT".to_string(),
+                    stp_mode: "".to_string(),
+                    side: side.to_uppercase(),
+                    transact_time: timestamp as i64,
+                })
+            } else {
+                anyhow::bail!("Order ID not found in KuCoin response: {}", response_text)
+            }
+        } else {
+            anyhow::bail!("Invalid KuCoin response format: {}", response_text)
+        }
     }
 
     async fn get_account_info(&self) -> Result<AccountInfo> {
