@@ -416,40 +416,50 @@ async fn place_orders_internal_with_iteration(
     }
     println!("{}", "═".repeat(70));
 
-    // Step 1: Calculate target order prices for each exchange
-    println!("\n📊 Step 1: Calculating target order prices for each exchange...");
-    let mut exchange_orders_list = Vec::new();
+    // Step 1: Collect mid prices from all exchanges
+    println!("\n📊 Step 1: Collecting mid prices from all exchanges...");
+    let mut mid_prices = Vec::new();
 
     for exchange_config in &config.exchanges {
-        match calculate_exchange_target_orders(exchange_config, &config.grid).await {
-            Ok(orders) => {
-                println!("  ✅ {}: {} buy orders, {} sell orders",
-                    exchange_config.name,
-                    orders.iter().filter(|o| o.side == "BUY").count(),
-                    orders.iter().filter(|o| o.side == "SELL").count()
-                );
-                exchange_orders_list.push((exchange_config.name.clone(), orders));
+        match get_exchange_mid_price(exchange_config, &config.grid).await {
+            Ok(price) => {
+                println!("  ✅ {}: {:.6}", exchange_config.name, price);
+                mid_prices.push(price);
             }
             Err(e) => {
-                println!("  ⚠️  {}: Failed to calculate orders - {}", exchange_config.name, e);
+                println!("  ⚠️  {}: Failed to get mid price - {}", exchange_config.name, e);
             }
         }
     }
 
-    if exchange_orders_list.is_empty() {
-        anyhow::bail!("Failed to calculate orders for any exchange");
+    if mid_prices.is_empty() {
+        anyhow::bail!("Failed to get mid price from any exchange");
     }
 
-    // Step 2: Calculate unified order prices (average across exchanges)
-    println!("\n💰 Step 2: Calculating unified order prices (average across all exchanges)");
-    let unified_orders = calculate_unified_orders(&exchange_orders_list)?;
+    // Step 2: Calculate unified mid price (average)
+    let unified_mid_price = mid_prices.iter().sum::<f64>() / mid_prices.len() as f64;
 
-    println!("  📝 Unified buy orders: {}", unified_orders.iter().filter(|o| o.side == "BUY").count());
-    println!("  📝 Unified sell orders: {}", unified_orders.iter().filter(|o| o.side == "SELL").count());
-    println!("  🔒 Using averaged prices to prevent cross-exchange arbitrage");
+    println!("\n💰 Step 2: Calculating unified mid price");
+    println!("  Individual mid prices: {:?}", mid_prices.iter().map(|p| format!("{:.6}", p)).collect::<Vec<_>>());
+    println!("  Unified mid price (average): {:.6}", unified_mid_price);
+    println!("  🔒 All exchanges will use this unified price to prevent arbitrage");
 
-    // Step 3: Place unified orders on all exchanges
-    println!("\n📝 Step 3: Placing unified orders on all exchanges...");
+    // Step 3: Calculate grid orders once using unified mid price
+    println!("\n📝 Step 3: Calculating grid orders using unified mid price...");
+    use crate::order_calculator::OrderCalculator;
+    let unified_orders = OrderCalculator::calculate_grid_orders(unified_mid_price, &config.grid);
+
+    println!("  Buy orders: {}", unified_orders.iter().filter(|o| o.side == "BUY").count());
+    println!("  Sell orders: {}", unified_orders.iter().filter(|o| o.side == "SELL").count());
+    if let Some(first_buy) = unified_orders.iter().find(|o| o.side == "BUY") {
+        println!("  First buy order: {:.8} USDT", first_buy.price);
+    }
+    if let Some(first_sell) = unified_orders.iter().find(|o| o.side == "SELL") {
+        println!("  First sell order: {:.8} USDT", first_sell.price);
+    }
+
+    // Step 4: Place unified orders on all exchanges
+    println!("\n📝 Step 4: Placing unified orders on all exchanges...");
     let mut all_success = true;
 
     for (i, exchange_config) in config.exchanges.iter().enumerate() {
@@ -481,11 +491,11 @@ async fn place_orders_internal_with_iteration(
     Ok(())
 }
 
-/// Calculate target order prices for a single exchange based on its own market data
-async fn calculate_exchange_target_orders(
+/// Get mid price from a single exchange
+async fn get_exchange_mid_price(
     exchange_config: &config::ExchangeConfig,
     grid_config: &config::GridConfig,
-) -> Result<Vec<order_calculator::GridOrder>> {
+) -> Result<f64> {
     use crate::order_calculator::OrderCalculator;
 
     // Parse exchange type
@@ -530,85 +540,7 @@ async fn calculate_exchange_target_orders(
         grid_config.volume_threshold_usdt,
     )?;
 
-    // Calculate grid orders based on this exchange's mid price
-    let orders = OrderCalculator::calculate_grid_orders(price_result.mid_price, grid_config);
-
-    Ok(orders)
-}
-
-/// Calculate unified order prices by averaging prices across all exchanges
-fn calculate_unified_orders(
-    exchange_orders_list: &[(String, Vec<order_calculator::GridOrder>)],
-) -> Result<Vec<order_calculator::GridOrder>> {
-    use crate::order_calculator::GridOrder;
-
-    if exchange_orders_list.is_empty() {
-        anyhow::bail!("No exchange orders to average");
-    }
-
-    // Separate buy and sell orders
-    let mut all_buy_orders: Vec<Vec<&GridOrder>> = Vec::new();
-    let mut all_sell_orders: Vec<Vec<&GridOrder>> = Vec::new();
-
-    for (_exchange_name, orders) in exchange_orders_list {
-        let buy_orders: Vec<&GridOrder> = orders.iter().filter(|o| o.side == "BUY").collect();
-        let sell_orders: Vec<&GridOrder> = orders.iter().filter(|o| o.side == "SELL").collect();
-
-        all_buy_orders.push(buy_orders);
-        all_sell_orders.push(sell_orders);
-    }
-
-    // Find the minimum number of orders (in case exchanges have different grid sizes)
-    let min_buy_count = all_buy_orders.iter().map(|v| v.len()).min().unwrap_or(0);
-    let min_sell_count = all_sell_orders.iter().map(|v| v.len()).min().unwrap_or(0);
-
-    let mut unified_orders = Vec::new();
-
-    // Average buy orders at each level
-    for level in 0..min_buy_count {
-        let prices: Vec<f64> = all_buy_orders.iter()
-            .filter_map(|orders| orders.get(level).map(|o| o.price))
-            .collect();
-
-        let quantities: Vec<f64> = all_buy_orders.iter()
-            .filter_map(|orders| orders.get(level).map(|o| o.quantity))
-            .collect();
-
-        if !prices.is_empty() {
-            let avg_price = prices.iter().sum::<f64>() / prices.len() as f64;
-            let avg_quantity = quantities.iter().sum::<f64>() / quantities.len() as f64;
-
-            unified_orders.push(GridOrder {
-                price: avg_price,
-                quantity: avg_quantity,
-                side: "BUY".to_string(),
-            });
-        }
-    }
-
-    // Average sell orders at each level
-    for level in 0..min_sell_count {
-        let prices: Vec<f64> = all_sell_orders.iter()
-            .filter_map(|orders| orders.get(level).map(|o| o.price))
-            .collect();
-
-        let quantities: Vec<f64> = all_sell_orders.iter()
-            .filter_map(|orders| orders.get(level).map(|o| o.quantity))
-            .collect();
-
-        if !prices.is_empty() {
-            let avg_price = prices.iter().sum::<f64>() / prices.len() as f64;
-            let avg_quantity = quantities.iter().sum::<f64>() / quantities.len() as f64;
-
-            unified_orders.push(GridOrder {
-                price: avg_price,
-                quantity: avg_quantity,
-                side: "SELL".to_string(),
-            });
-        }
-    }
-
-    Ok(unified_orders)
+    Ok(price_result.mid_price)
 }
 
 /// Place unified orders on a specific exchange
