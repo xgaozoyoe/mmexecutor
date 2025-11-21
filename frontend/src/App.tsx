@@ -131,6 +131,7 @@ function App() {
     fetchReport();
     const interval = setInterval(fetchReport, 30000); // Refresh every 30 seconds
     return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (loading && !reportData) {
@@ -351,17 +352,42 @@ function App() {
                   // If base asset increased (bought), price is negative quote change / positive base change
                   const avgPrice = baseChange !== 0 ? Math.abs(quoteChange / baseChange) : 0;
                   const tradeDirection = baseChange < 0 ? 'Selling' : baseChange > 0 ? 'Buying' : 'No Trade';
+                  const currentPrice = exchange.market_depth.current_price;
+                  const priceDiff = avgPrice - currentPrice;
+                  const priceDiffPercent = currentPrice > 0 ? (priceDiff / currentPrice) * 100 : 0;
 
                   return avgPrice > 0 ? (
                     <div className="pnl-asset-card pnl-avg-price">
-                      <h4>📊 Average Trading Price</h4>
+                      <h4>📊 Average Trading Price Analysis</h4>
                       <div className="pnl-details">
                         <div>Direction: <strong>{tradeDirection} {exchange.pnl_summary.base_asset_summary.asset}</strong></div>
                         <div>Average Price: <strong>{avgPrice.toFixed(6)} {exchange.pnl_summary.quote_asset_summary.asset}</strong></div>
                         <div className="price-calculation">
                           <small>
-                            {Math.abs(quoteChange).toFixed(2)} {exchange.pnl_summary.quote_asset_summary.asset} ÷ {Math.abs(baseChange).toFixed(2)} {exchange.pnl_summary.base_asset_summary.asset}
+                            Calculation: {Math.abs(quoteChange).toFixed(2)} {exchange.pnl_summary.quote_asset_summary.asset} ÷ {Math.abs(baseChange).toFixed(8)} {exchange.pnl_summary.base_asset_summary.asset}
                           </small>
+                        </div>
+                        <div className="price-comparison">
+                          <div>Current Market Price: <strong>{currentPrice.toFixed(6)}</strong></div>
+                          <div className={priceDiff >= 0 ? 'price-diff-negative' : 'price-diff-positive'}>
+                            {baseChange < 0 ? (
+                              // If selling, we want average price > current price (sold high)
+                              <>
+                                Price Difference: <strong>{priceDiff >= 0 ? '+' : ''}{priceDiff.toFixed(6)} ({priceDiff >= 0 ? '+' : ''}{priceDiffPercent.toFixed(2)}%)</strong>
+                                <div className="performance-indicator">
+                                  {priceDiff > 0 ? '✅ Sold above current market price' : '⚠️ Sold below current market price'}
+                                </div>
+                              </>
+                            ) : (
+                              // If buying, we want average price < current price (bought low)
+                              <>
+                                Price Difference: <strong>{priceDiff >= 0 ? '+' : ''}{priceDiff.toFixed(6)} ({priceDiff >= 0 ? '+' : ''}{priceDiffPercent.toFixed(2)}%)</strong>
+                                <div className="performance-indicator">
+                                  {priceDiff < 0 ? '✅ Bought below current market price' : '⚠️ Bought above current market price'}
+                                </div>
+                              </>
+                            )}
+                          </div>
                         </div>
                       </div>
                     </div>

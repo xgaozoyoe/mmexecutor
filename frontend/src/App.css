@@ -273,6 +273,7 @@
 .pnl-avg-price {
   background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
   border: 2px solid #667eea;
+  grid-column: 1 / -1;
 }
 
 .pnl-avg-price h4 {
@@ -291,6 +292,46 @@
 .price-calculation small {
   color: #636e72;
   font-family: monospace;
+}
+
+.price-comparison {
+  margin-top: 15px;
+  padding: 15px;
+  background: rgba(255, 255, 255, 0.8);
+  border-radius: 8px;
+  border: 2px solid #dfe6e9;
+}
+
+.price-comparison > div {
+  padding: 8px 0;
+}
+
+.price-diff-positive {
+  color: #27ae60;
+  background: linear-gradient(135deg, #d4fc79 0%, #96e6a1 100%);
+  padding: 12px;
+  border-radius: 6px;
+  margin-top: 10px;
+  font-weight: 600;
+}
+
+.price-diff-negative {
+  color: #e74c3c;
+  background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+  padding: 12px;
+  border-radius: 6px;
+  margin-top: 10px;
+  font-weight: 600;
+}
+
+.performance-indicator {
+  margin-top: 10px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.5);
+  border-radius: 5px;
+  text-align: center;
+  font-size: 1.05em;
+  font-weight: bold;
 }
 
 .pnl-details div {

@@ -183,9 +183,37 @@ The React dashboard displays:
 
 ### 5. **Profit & Loss Summary**
 - Time period analysis
-- Starting and ending values
+- Starting and ending values for both base and quote assets
 - Absolute and percentage changes
 - Color-coded gains (green) and losses (red)
+
+### 6. **Average Trading Price Analysis** ⭐ NEW
+This powerful feature calculates and displays:
+- **Direction**: Whether the bot is buying or selling the base asset
+- **Average Price**: The calculated average price at which trades were executed
+  - Formula: `|USDT Change| ÷ |Token Change|`
+- **Current Market Price**: For comparison
+- **Price Difference**: How much the average trading price differs from current market price
+  - Shown as both absolute value and percentage
+- **Performance Indicator**:
+  - ✅ When selling: Shows if you sold above current market price (good)
+  - ✅ When buying: Shows if you bought below current market price (good)
+  - ⚠️ Otherwise shows a warning
+
+**Example Calculation:**
+```
+If USDT decreased by -150.50 and ZKWASM increased by +10000.0:
+Average Buying Price = 150.50 ÷ 10000.0 = 0.015050 USDT
+
+If current market price is 0.015200:
+Price Difference = 0.015050 - 0.015200 = -0.000150 (-0.99%)
+Result: ✅ Bought below current market price (profitable position)
+```
+
+This helps you understand:
+- Whether your automated trades are getting good prices
+- If the bot is buying low and selling high
+- Your potential unrealized profit/loss based on current market prices
 
 ## Configuration
 
