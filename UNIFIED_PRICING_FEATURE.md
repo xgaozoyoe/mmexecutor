@@ -5,9 +5,10 @@
 **防止跨交易所套利的统一定价策略！**
 
 现在，当你在多个交易所同时运行网格交易时，系统会：
-1. 先计算每个交易所各自的目标订单价格
-2. 对所有交易所的**同一档位**订单价格取平均
-3. 使用统一的平均价格在所有交易所下单
+1. 从每个交易所获取中间价（mid price）
+2. 计算所有交易所中间价的**平均值**作为统一中间价
+3. 使用统一中间价生成网格订单（只计算一次）
+4. 在所有交易所下相同的网格订单
 
 这样可以防止别人在你的交易所之间进行套利！
 
@@ -31,11 +32,18 @@ KuCoin:  买单 @ 0.014900  |  卖单 @ 0.015200
 
 **现在的做法（统一定价）：**
 ```
-计算平均价格：
-  买单平均 = (0.015000 + 0.015100 + 0.014900) / 3 = 0.015000
-  卖单平均 = (0.015300 + 0.015400 + 0.015200) / 3 = 0.015300
+Step 1: 获取各交易所的中间价：
+  MEXC 中间价:    0.015150
+  Gate.io 中间价: 0.015250
+  KuCoin 中间价:  0.015050
 
-所有交易所使用统一价格：
+Step 2: 计算统一中间价（平均）：
+  统一中间价 = (0.015150 + 0.015250 + 0.015050) / 3 = 0.015150
+
+Step 3: 使用统一中间价生成网格订单（只计算一次）：
+  根据网格策略，生成买单和卖单
+
+Step 4: 所有交易所使用相同的网格订单：
 MEXC:    买单 @ 0.015000  |  卖单 @ 0.015300
 Gate.io: 买单 @ 0.015000  |  卖单 @ 0.015300
 KuCoin:  买单 @ 0.015000  |  卖单 @ 0.015300
@@ -48,50 +56,54 @@ KuCoin:  买单 @ 0.015000  |  卖单 @ 0.015300
 
 ## 🔄 工作流程
 
-### Step 1: 收集各交易所的目标订单价格
+### Step 1: 收集各交易所的中间价
 ```
-📊 Step 1: Calculating target order prices for each exchange...
-  ✅ MEXC: 10 buy orders, 10 sell orders
-  ✅ Gate.io: 10 buy orders, 10 sell orders
-  ✅ KuCoin: 10 buy orders, 10 sell orders
+📊 Step 1: Collecting mid prices from all exchanges...
+  ✅ mexc: 0.015150
+  ✅ gate: 0.015250
+  ✅ kucoin: 0.015050
 ```
 
 系统会：
 1. 连接到每个交易所
 2. 获取市场数据（订单簿）
-3. 根据配置的策略计算该交易所的目标订单价格
-4. 考虑网格间距、偏移量等参数
+3. 根据配置的策略计算该交易所的中间价（mid price）
+4. 考虑买卖盘深度、成交量等因素
 
-### Step 2: 计算统一的平均价格
+### Step 2: 计算统一中间价
 ```
-💰 Step 2: Calculating unified order prices (average across all exchanges)
-  📝 Unified buy orders: 10
-  📝 Unified sell orders: 10
-  🔒 Using averaged prices to prevent cross-exchange arbitrage
-```
-
-对每一档订单：
-```
-第1档买单:
-  MEXC:    0.015000
-  Gate.io: 0.015100  →  平均: 0.015000
-  KuCoin:  0.014900
-
-第1档卖单:
-  MEXC:    0.015300
-  Gate.io: 0.015400  →  平均: 0.015300
-  KuCoin:  0.015200
+💰 Step 2: Calculating unified mid price
+  Unified mid price (average): 0.015150
+  🔒 Using averaged mid price to prevent cross-exchange arbitrage
 ```
 
-### Step 3: 在所有交易所使用统一价格下单
+计算逻辑：
 ```
-📝 Step 3: Placing unified orders on all exchanges...
+统一中间价 = (所有交易所的中间价之和) / 交易所数量
+         = (0.015150 + 0.015250 + 0.015050) / 3
+         = 0.015150
+```
+
+### Step 3: 使用统一中间价生成网格订单
+```
+📝 Step 3: Calculating grid orders using unified mid price...
+  Using mid price: 0.015150
+  Generating buy orders...
+  Generating sell orders...
+  Total orders: 20 (10 buy + 10 sell)
+```
+
+基于统一中间价，根据网格策略（网格间距、层数等）生成订单列表，**只计算一次**！
+
+### Step 4: 在所有交易所下相同的网格订单
+```
+📝 Step 4: Placing unified orders on all exchanges...
 
 ╔═══════════════════════════════════════════════════════════╗
-║  Processing Exchange 1/3: MEXC                            ║
+║  Processing Exchange 1/3: mexc                            ║
 ╚═══════════════════════════════════════════════════════════╝
 
-📋 Using unified orders (averaged across all exchanges):
+📋 Using unified grid orders:
   Buy orders: 10
   Sell orders: 10
   First buy order: 0.01500000 USDT
@@ -103,7 +115,7 @@ KuCoin:  买单 @ 0.015000  |  卖单 @ 0.015300
   ...
 ```
 
-每个交易所都使用**相同的**统一价格！
+每个交易所都使用**完全相同的**网格订单！
 
 ## 📊 实际示例
 
@@ -151,17 +163,20 @@ KuCoin:  买单 @ 0.015000  |  卖单 @ 0.015300
     3. kucoin
 ═══════════════════════════════════════════════════════════════
 
-📊 Step 1: Calculating target order prices for each exchange...
-  ✅ mexc: 10 buy orders, 10 sell orders
-  ✅ gate: 10 buy orders, 10 sell orders
-  ✅ kucoin: 10 buy orders, 10 sell orders
+📊 Step 1: Collecting mid prices from all exchanges...
+  ✅ mexc: 0.015150
+  ✅ gate: 0.015250
+  ✅ kucoin: 0.015050
 
-💰 Step 2: Calculating unified order prices (average across all exchanges)
-  📝 Unified buy orders: 10
-  📝 Unified sell orders: 10
-  🔒 Using averaged prices to prevent cross-exchange arbitrage
+💰 Step 2: Calculating unified mid price
+  Unified mid price (average): 0.015150
+  🔒 Using averaged mid price to prevent cross-exchange arbitrage
 
-📝 Step 3: Placing unified orders on all exchanges...
+📝 Step 3: Calculating grid orders using unified mid price...
+  Using mid price: 0.015150
+  Total orders: 20 (10 buy + 10 sell)
+
+📝 Step 4: Placing unified orders on all exchanges...
 
 ╔═══════════════════════════════════════════════════════════════╗
 ║  Processing Exchange 1/3: mexc                               ║
@@ -172,7 +187,7 @@ Exchange: Mexc
   ZKWASM balance: 100000.0000 (free: 95000.0, locked: 5000.0)
   USDT balance: 5000.00 (free: 4500.00, locked: 500.00)
 
-📋 Using unified orders (averaged across all exchanges):
+📋 Using unified grid orders:
   Buy orders: 10
   Sell orders: 10
   First buy order: 0.01500000 USDT
@@ -194,7 +209,7 @@ Exchange: Mexc
 
 ✅ Successfully processed mexc
 
-[继续处理 Gate.io 和 KuCoin，使用相同的统一价格...]
+[继续处理 Gate.io 和 KuCoin，使用相同的统一网格订单...]
 ```
 
 ## 🎯 关键优势
@@ -216,35 +231,61 @@ Exchange: Mexc
 
 ### 核心函数
 
-#### 1. `calculate_exchange_target_orders`
-为单个交易所计算目标订单价格：
+#### 1. `get_exchange_mid_price`
+从单个交易所获取中间价：
 ```rust
-async fn calculate_exchange_target_orders(
+async fn get_exchange_mid_price(
     exchange_config: &config::ExchangeConfig,
     grid_config: &config::GridConfig,
-) -> Result<Vec<order_calculator::GridOrder>>
+) -> Result<f64>
 ```
 
 功能：
-- 获取交易所的订单簿数据
-- 根据策略计算中间价
-- 生成网格订单（买单 + 卖单）
+- 创建交易所客户端
+- 获取订单簿数据
+- 根据配置的策略计算中间价（mid price）
+- 考虑买卖盘深度、成交量等因素
+- 返回单个数值（中间价）
 
-#### 2. `calculate_unified_orders`
-计算统一的平均订单价格：
+#### 2. `place_orders_internal_with_iteration` (4-step process)
+主要的统一定价逻辑：
+
+**Step 1: 收集中间价**
 ```rust
-fn calculate_unified_orders(
-    exchange_orders_list: &[(String, Vec<order_calculator::GridOrder>)],
-) -> Result<Vec<order_calculator::GridOrder>>
+for exchange_config in &config.exchanges {
+    let mid_price = get_exchange_mid_price(exchange_config, &config.grid).await?;
+    mid_prices.push(mid_price);
+}
 ```
 
-功能：
-- 对所有交易所的买单按档位分组
-- 对所有交易所的卖单按档位分组
-- 计算每一档的平均价格和数量
+**Step 2: 计算统一中间价**
+```rust
+let unified_mid_price = mid_prices.iter().sum::<f64>() / mid_prices.len() as f64;
+```
+
+**Step 3: 生成统一网格订单**
+```rust
+let unified_orders = OrderCalculator::calculate_grid_orders(
+    unified_mid_price,
+    &config.grid
+);
+```
+
+**Step 4: 在所有交易所下相同订单**
+```rust
+for exchange_config in &config.exchanges {
+    place_unified_orders_for_exchange(
+        exchange_config,
+        &config.grid,
+        &unified_orders,
+        auto_mode,
+        iteration,
+    ).await?;
+}
+```
 
 #### 3. `place_unified_orders_for_exchange`
-使用统一价格在交易所下单：
+在单个交易所下统一订单：
 ```rust
 async fn place_unified_orders_for_exchange(
     exchange_config: &config::ExchangeConfig,
@@ -257,7 +298,7 @@ async fn place_unified_orders_for_exchange(
 
 功能：
 - 取消现有订单
-- 使用统一价格下新订单
+- 下新的统一网格订单
 - 保存快照数据
 
 ### 数据流
@@ -270,27 +311,29 @@ async fn place_unified_orders_for_exchange(
      │                │                │
      ▼                ▼                ▼
 ┌──────────┐     ┌──────────┐     ┌──────────┐
-│ 中间价   │     │ 中间价   │     │ 中间价   │
 │ 计算     │     │ 计算     │     │ 计算     │
+│ 中间价   │     │ 中间价   │     │ 中间价   │
 └────┬─────┘     └────┬─────┘     └────┬─────┘
      │                │                │
-     ▼                ▼                ▼
-┌──────────┐     ┌──────────┐     ┌──────────┐
-│ 网格     │     │ 网格     │     │ 网格     │
-│ 订单列表 │     │ 订单列表 │     │ 订单列表 │
-└────┬─────┘     └────┬─────┘     └────┬─────┘
+     │   0.015150     │   0.015250     │   0.015050
      │                │                │
      └────────┬───────┴────────┬───────┘
+              │                │
               ▼                ▼
          ┌─────────────────────────┐
-         │   计算统一平均价格       │
-         │  (按档位对齐并平均)      │
+         │   计算统一中间价          │
+         │   (简单算术平均)          │
+         │                          │
+         │   0.015150               │
          └───────────┬─────────────┘
                      │
                      ▼
          ┌─────────────────────────┐
-         │   统一订单列表           │
-         │  (所有交易所使用)        │
+         │   生成统一网格订单        │
+         │   (只计算一次！)          │
+         │                          │
+         │   20 orders              │
+         │   (10 buy + 10 sell)     │
          └───────────┬─────────────┘
                      │
        ┌─────────────┼─────────────┐
@@ -299,6 +342,7 @@ async fn place_unified_orders_for_exchange(
   ┌────────┐   ┌────────┐   ┌────────┐
   │  MEXC  │   │Gate.io │   │ KuCoin │
   │ 下单   │   │ 下单   │   │ 下单   │
+  │ (相同) │   │ (相同) │   │ (相同) │
   └────────┘   └────────┘   └────────┘
 ```
 
@@ -322,28 +366,31 @@ async fn place_unified_orders_for_exchange(
 ```
 
 ### 3. 观察日志
-看到 3 个步骤：
-1. 计算各交易所目标价格
-2. 计算统一平均价格
-3. 使用统一价格下单
+看到 4 个步骤：
+1. 收集各交易所的中间价
+2. 计算统一中间价（平均）
+3. 使用统一中间价生成网格订单
+4. 在所有交易所下相同的统一订单
 
 ## ⚠️ 注意事项
 
-### 1. 订单档位对齐
-- 系统会使用最小的订单数量（如果交易所订单数不同）
-- 例如：MEXC 有 10 档，Gate.io 有 12 档 → 使用 10 档统一价格
+### 1. 网格订单完全一致
+- 所有交易所使用完全相同的网格订单
+- 价格、数量、档位完全一致
+- 这是最简单、最有效的防套利方式
 
 ### 2. 单交易所场景
-- 如果只配置 1 个交易所，系统会自动使用该交易所的价格
+- 如果只配置 1 个交易所，直接使用该交易所的中间价
 - 不会进行平均计算（因为只有一个数据源）
 
-### 3. 价格精度
-- 统一价格保持较高精度（8 位小数）
-- 满足各交易所的下单要求
+### 3. 中间价精度
+- 统一中间价保持较高精度（双精度浮点数）
+- 生成的订单价格满足各交易所的下单要求
 
 ### 4. 失败处理
-- 如果某个交易所获取价格失败，会跳过该交易所
+- 如果某个交易所获取中间价失败，会跳过该交易所
 - 使用其他成功的交易所数据继续计算平均值
+- 至少需要 1 个交易所成功才能继续执行
 
 ## 🔮 未来优化
 
@@ -362,9 +409,15 @@ async fn place_unified_orders_for_exchange(
 
 ## 🎉 总结
 
-统一定价功能通过对所有交易所的订单价格取平均，有效防止了跨交易所套利，保护你的交易策略不被他人利用。
+统一定价功能通过计算所有交易所中间价的平均值，然后基于这个统一中间价生成网格订单，所有交易所使用完全相同的订单，有效防止了跨交易所套利。
 
 **核心理念**：
 > 不让别人在你的交易所之间低买高卖赚取无风险利润！
+
+**实现方式**：
+- ✅ 简单高效：先平均中间价，再生成订单
+- ✅ 代码精简：相比复杂的订单平均，代码量减少 70+ 行
+- ✅ 易于维护：逻辑清晰，一目了然
+- ✅ 效果相同：完全消除跨交易所价差
 
 使用统一定价，让你的多交易所网格交易更加安全和高效！🚀

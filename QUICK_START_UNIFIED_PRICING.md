@@ -45,20 +45,23 @@
 
 ### 3. 观察输出
 
-你会看到 3 个步骤：
+你会看到 4 个步骤：
 
 ```
-📊 Step 1: Calculating target order prices for each exchange...
-  ✅ mexc: 10 buy orders, 10 sell orders
-  ✅ gate: 10 buy orders, 10 sell orders
-  ✅ kucoin: 10 buy orders, 10 sell orders
+📊 Step 1: Collecting mid prices from all exchanges...
+  ✅ mexc: 0.015150
+  ✅ gate: 0.015250
+  ✅ kucoin: 0.015050
 
-💰 Step 2: Calculating unified order prices (average across all exchanges)
-  📝 Unified buy orders: 10
-  📝 Unified sell orders: 10
-  🔒 Using averaged prices to prevent cross-exchange arbitrage
+💰 Step 2: Calculating unified mid price
+  Unified mid price (average): 0.015150
+  🔒 Using averaged mid price to prevent cross-exchange arbitrage
 
-📝 Step 3: Placing unified orders on all exchanges...
+📝 Step 3: Calculating grid orders using unified mid price...
+  Using mid price: 0.015150
+  Total orders: 20 (10 buy + 10 sell)
+
+📝 Step 4: Placing unified orders on all exchanges...
 ```
 
 就这么简单！🎉
@@ -89,21 +92,29 @@ KuCoin:  买 @ 0.015000  卖 @ 0.015300
 
 ### 简单说明
 
-1. **收集价格**：从每个交易所获取它应该下单的价格
-2. **计算平均**：把所有交易所的相同档位订单价格取平均
-3. **统一下单**：所有交易所使用这个平均价格
+1. **收集中间价**：从每个交易所获取当前的市场中间价
+2. **计算平均中间价**：把所有交易所的中间价取平均
+3. **生成网格订单**：使用平均中间价生成网格订单（只计算一次）
+4. **统一下单**：所有交易所使用完全相同的网格订单
 
 ### 举例
 
 ```
-第1档买单：
-  MEXC 想下: 0.015000
-  Gate 想下: 0.015100
-  KuCoin 想下: 0.014900
+Step 1 - 收集中间价：
+  MEXC 中间价:    0.015150
+  Gate 中间价:    0.015250
+  KuCoin 中间价:  0.015050
 
-  平均价格 = (0.015000 + 0.015100 + 0.014900) / 3 = 0.015000
+Step 2 - 计算平均：
+  统一中间价 = (0.015150 + 0.015250 + 0.015050) / 3 = 0.015150
 
-  实际下单：所有交易所都用 0.015000
+Step 3 - 生成网格订单（只计算一次）：
+  根据统一中间价 0.015150 和网格策略，生成：
+  - 10 个买单
+  - 10 个卖单
+
+Step 4 - 所有交易所使用相同订单：
+  MEXC、Gate、KuCoin 都下相同的 20 个订单
 ```
 
 ## ✅ 优势
@@ -125,15 +136,20 @@ KuCoin:  买 @ 0.015000  卖 @ 0.015300
 运行时注意这些关键信息：
 
 ```bash
-# Step 1 - 显示每个交易所的订单数
-✅ mexc: 10 buy orders, 10 sell orders
+# Step 1 - 显示每个交易所的中间价
+✅ mexc: 0.015150
+✅ gate: 0.015250
 
-# Step 2 - 显示统一后的订单数
-📝 Unified buy orders: 10
-📝 Unified sell orders: 10
+# Step 2 - 显示统一中间价
+💰 Unified mid price (average): 0.015150
+🔒 Using averaged mid price to prevent cross-exchange arbitrage
 
-# Step 3 - 每个交易所都使用统一价格
-📋 Using unified orders (averaged across all exchanges):
+# Step 3 - 显示生成的网格订单
+📝 Using mid price: 0.015150
+📝 Total orders: 20 (10 buy + 10 sell)
+
+# Step 4 - 每个交易所都使用统一订单
+📋 Using unified grid orders:
   First buy order: 0.01500000 USDT
   First sell order: 0.01530000 USDT
 ```
@@ -142,37 +158,37 @@ KuCoin:  买 @ 0.015000  卖 @ 0.015300
 
 ### 方法 1：查看日志
 
-看到 "Using averaged prices to prevent cross-exchange arbitrage" 就说明启用了
+看到 "Using averaged mid price to prevent cross-exchange arbitrage" 就说明启用了
 
 ### 方法 2：检查订单
 
-登录各个交易所查看实际下单价格，应该完全一致
+登录各个交易所查看实际下单价格，应该完全一致（每一档订单的价格都相同）
 
 ### 方法 3：对比价格
 
 ```bash
-# 第一个交易所的买单价格
-grep "BUY ZKWASMUSDT" logs.txt | head -1
+# 查看日志中的订单价格
+grep "BUY ZKWASMUSDT" logs.txt
 
-# 第二个交易所的买单价格
-grep "BUY ZKWASMUSDT" logs.txt | tail -1
-
-# 价格应该相同！
+# 所有交易所的相同档位订单价格应该完全一样！
 ```
 
 ## ❓ 常见问题
 
 ### Q: 只有1个交易所会怎样？
-**A:** 自动使用该交易所的价格，不进行平均（因为只有一个数据源）
+**A:** 自动使用该交易所的中间价，不进行平均（因为只有一个数据源）
 
-### Q: 某个交易所价格获取失败怎么办？
-**A:** 使用其他成功的交易所计算平均价格，继续执行
+### Q: 某个交易所中间价获取失败怎么办？
+**A:** 使用其他成功的交易所计算平均中间价，继续执行
 
 ### Q: 会影响原有策略吗？
-**A:** 不会！网格间距、偏移量等配置完全保留，只是最终价格取平均
+**A:** 不会！网格间距、偏移量等配置完全保留，只是基于平均中间价生成订单
 
 ### Q: 需要重新配置吗？
 **A:** 不需要！只要配置了多个交易所就自动启用
+
+### Q: 和之前的订单平均有什么不同？
+**A:** 更简单！之前是先生成各交易所的订单再平均（复杂），现在是先平均中间价再生成订单（简单）
 
 ## 🎯 最佳实践
 
