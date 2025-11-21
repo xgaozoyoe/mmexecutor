@@ -416,14 +416,54 @@ async fn place_orders_internal_with_iteration(
     }
     println!("{}", "═".repeat(70));
 
+    // Step 1: Calculate target order prices for each exchange
+    println!("\n📊 Step 1: Calculating target order prices for each exchange...");
+    let mut exchange_orders_list = Vec::new();
+
+    for exchange_config in &config.exchanges {
+        match calculate_exchange_target_orders(exchange_config, &config.grid).await {
+            Ok(orders) => {
+                println!("  ✅ {}: {} buy orders, {} sell orders",
+                    exchange_config.name,
+                    orders.iter().filter(|o| o.side == "BUY").count(),
+                    orders.iter().filter(|o| o.side == "SELL").count()
+                );
+                exchange_orders_list.push((exchange_config.name.clone(), orders));
+            }
+            Err(e) => {
+                println!("  ⚠️  {}: Failed to calculate orders - {}", exchange_config.name, e);
+            }
+        }
+    }
+
+    if exchange_orders_list.is_empty() {
+        anyhow::bail!("Failed to calculate orders for any exchange");
+    }
+
+    // Step 2: Calculate unified order prices (average across exchanges)
+    println!("\n💰 Step 2: Calculating unified order prices (average across all exchanges)");
+    let unified_orders = calculate_unified_orders(&exchange_orders_list)?;
+
+    println!("  📝 Unified buy orders: {}", unified_orders.iter().filter(|o| o.side == "BUY").count());
+    println!("  📝 Unified sell orders: {}", unified_orders.iter().filter(|o| o.side == "SELL").count());
+    println!("  🔒 Using averaged prices to prevent cross-exchange arbitrage");
+
+    // Step 3: Place unified orders on all exchanges
+    println!("\n📝 Step 3: Placing unified orders on all exchanges...");
     let mut all_success = true;
 
     for (i, exchange_config) in config.exchanges.iter().enumerate() {
-        println!("\n\n╔═══════════════════════════════════════════════════════════════╗");
+        println!("\n╔═══════════════════════════════════════════════════════════════╗");
         println!("║  Processing Exchange {}/{}: {:<37} ║", i + 1, config.exchanges.len(), exchange_config.name);
         println!("╚═══════════════════════════════════════════════════════════════╝\n");
 
-        match place_orders_for_exchange(exchange_config, &config.grid, auto_mode, iteration).await {
+        match place_unified_orders_for_exchange(
+            exchange_config,
+            &config.grid,
+            &unified_orders,
+            auto_mode,
+            iteration
+        ).await {
             Ok(_) => println!("\n✅ Successfully processed {}", exchange_config.name),
             Err(e) => {
                 println!("\n❌ Failed to process {}: {}", exchange_config.name, e);
@@ -437,6 +477,270 @@ async fn place_orders_internal_with_iteration(
     } else {
         println!("\n\n⚠️  Some exchanges failed. Please check the errors above.");
     }
+
+    Ok(())
+}
+
+/// Calculate target order prices for a single exchange based on its own market data
+async fn calculate_exchange_target_orders(
+    exchange_config: &config::ExchangeConfig,
+    grid_config: &config::GridConfig,
+) -> Result<Vec<order_calculator::GridOrder>> {
+    use crate::order_calculator::OrderCalculator;
+
+    // Parse exchange type
+    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
+        .context(format!("Invalid exchange type: {}", exchange_config.name))?;
+
+    // Create exchange client
+    let client = create_exchange(
+        &exchange_type,
+        exchange_config.api_key.clone(),
+        exchange_config.api_secret.clone(),
+        exchange_config.api_passphrase.clone(),
+    )?;
+
+    // Get order book
+    let order_book = client
+        .get_order_book(&grid_config.symbol, Some(grid_config.orderbook_depth))
+        .await?;
+
+    if order_book.bids.is_empty() || order_book.asks.is_empty() {
+        anyhow::bail!("Order book is empty");
+    }
+
+    // Get all orders if needed for VolumeThreshold method
+    let all_orders = if matches!(grid_config.mid_price_method_bid, config::MidPriceMethod::VolumeThreshold)
+        || matches!(grid_config.mid_price_method_ask, config::MidPriceMethod::VolumeThreshold)
+    {
+        match client.get_all_orders(&grid_config.symbol, Some(500)).await {
+            Ok(orders) => Some(orders),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    // Calculate mid price for this exchange
+    let price_result = PriceCalculator::calculate_mid_price(
+        &order_book,
+        &grid_config.mid_price_method_bid,
+        &grid_config.mid_price_method_ask,
+        all_orders.as_deref(),
+        grid_config.volume_threshold_usdt,
+    )?;
+
+    // Calculate grid orders based on this exchange's mid price
+    let orders = OrderCalculator::calculate_grid_orders(price_result.mid_price, grid_config);
+
+    Ok(orders)
+}
+
+/// Calculate unified order prices by averaging prices across all exchanges
+fn calculate_unified_orders(
+    exchange_orders_list: &[(String, Vec<order_calculator::GridOrder>)],
+) -> Result<Vec<order_calculator::GridOrder>> {
+    use crate::order_calculator::GridOrder;
+
+    if exchange_orders_list.is_empty() {
+        anyhow::bail!("No exchange orders to average");
+    }
+
+    // Separate buy and sell orders
+    let mut all_buy_orders: Vec<Vec<&GridOrder>> = Vec::new();
+    let mut all_sell_orders: Vec<Vec<&GridOrder>> = Vec::new();
+
+    for (_exchange_name, orders) in exchange_orders_list {
+        let buy_orders: Vec<&GridOrder> = orders.iter().filter(|o| o.side == "BUY").collect();
+        let sell_orders: Vec<&GridOrder> = orders.iter().filter(|o| o.side == "SELL").collect();
+
+        all_buy_orders.push(buy_orders);
+        all_sell_orders.push(sell_orders);
+    }
+
+    // Find the minimum number of orders (in case exchanges have different grid sizes)
+    let min_buy_count = all_buy_orders.iter().map(|v| v.len()).min().unwrap_or(0);
+    let min_sell_count = all_sell_orders.iter().map(|v| v.len()).min().unwrap_or(0);
+
+    let mut unified_orders = Vec::new();
+
+    // Average buy orders at each level
+    for level in 0..min_buy_count {
+        let prices: Vec<f64> = all_buy_orders.iter()
+            .filter_map(|orders| orders.get(level).map(|o| o.price))
+            .collect();
+
+        let quantities: Vec<f64> = all_buy_orders.iter()
+            .filter_map(|orders| orders.get(level).map(|o| o.quantity))
+            .collect();
+
+        if !prices.is_empty() {
+            let avg_price = prices.iter().sum::<f64>() / prices.len() as f64;
+            let avg_quantity = quantities.iter().sum::<f64>() / quantities.len() as f64;
+
+            unified_orders.push(GridOrder {
+                price: avg_price,
+                quantity: avg_quantity,
+                side: "BUY".to_string(),
+            });
+        }
+    }
+
+    // Average sell orders at each level
+    for level in 0..min_sell_count {
+        let prices: Vec<f64> = all_sell_orders.iter()
+            .filter_map(|orders| orders.get(level).map(|o| o.price))
+            .collect();
+
+        let quantities: Vec<f64> = all_sell_orders.iter()
+            .filter_map(|orders| orders.get(level).map(|o| o.quantity))
+            .collect();
+
+        if !prices.is_empty() {
+            let avg_price = prices.iter().sum::<f64>() / prices.len() as f64;
+            let avg_quantity = quantities.iter().sum::<f64>() / quantities.len() as f64;
+
+            unified_orders.push(GridOrder {
+                price: avg_price,
+                quantity: avg_quantity,
+                side: "SELL".to_string(),
+            });
+        }
+    }
+
+    Ok(unified_orders)
+}
+
+/// Place unified orders on a specific exchange
+async fn place_unified_orders_for_exchange(
+    exchange_config: &config::ExchangeConfig,
+    grid_config: &config::GridConfig,
+    unified_orders: &[order_calculator::GridOrder],
+    auto_mode: bool,
+    iteration: Option<u64>,
+) -> Result<()> {
+    // Parse exchange type
+    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
+        .context(format!("Invalid exchange type: {}", exchange_config.name))?;
+
+    println!("Exchange: {:?}", exchange_type);
+
+    // Create exchange client
+    let client = create_exchange(
+        &exchange_type,
+        exchange_config.api_key.clone(),
+        exchange_config.api_secret.clone(),
+        exchange_config.api_passphrase.clone(),
+    )?;
+
+    // Show account info
+    show_account_info(&client, &grid_config.symbol).await?;
+
+    println!("\n📋 Using unified orders (averaged across all exchanges):");
+    println!("  Buy orders: {}", unified_orders.iter().filter(|o| o.side == "BUY").count());
+    println!("  Sell orders: {}", unified_orders.iter().filter(|o| o.side == "SELL").count());
+
+    // Show some example prices
+    if let Some(first_buy) = unified_orders.iter().find(|o| o.side == "BUY") {
+        println!("  First buy order: {:.8} USDT", first_buy.price);
+    }
+    if let Some(first_sell) = unified_orders.iter().find(|o| o.side == "SELL") {
+        println!("  First sell order: {:.8} USDT", first_sell.price);
+    }
+
+    // Get existing open orders
+    let open_orders = client.get_open_orders(Some(&grid_config.symbol)).await?;
+    println!("\n📊 Current open orders: {}", open_orders.len());
+
+    // Cancel existing orders
+    if !open_orders.is_empty() {
+        println!("🔄 Canceling {} existing orders...", open_orders.len());
+        for order in &open_orders {
+            match client.cancel_order(&grid_config.symbol, &order.order_id).await {
+                Ok(_) => {},
+                Err(e) => println!("  ⚠️  Warning: Failed to cancel order {}: {}", order.order_id, e),
+            }
+        }
+        println!("  ✅ Canceled existing orders");
+    }
+
+    // Save snapshot
+    if let Some(iter) = iteration {
+        // Calculate reference price from unified orders
+        let buy_prices: Vec<f64> = unified_orders.iter()
+            .filter(|o| o.side == "BUY")
+            .map(|o| o.price)
+            .collect();
+        let sell_prices: Vec<f64> = unified_orders.iter()
+            .filter(|o| o.side == "SELL")
+            .map(|o| o.price)
+            .collect();
+
+        let reference_price = if !buy_prices.is_empty() && !sell_prices.is_empty() {
+            (buy_prices.iter().sum::<f64>() / buy_prices.len() as f64 + sell_prices.iter().sum::<f64>() / sell_prices.len() as f64) / 2.0
+        } else if !buy_prices.is_empty() {
+            buy_prices.iter().sum::<f64>() / buy_prices.len() as f64
+        } else if !sell_prices.is_empty() {
+            sell_prices.iter().sum::<f64>() / sell_prices.len() as f64
+        } else {
+            0.0
+        };
+
+        if reference_price > 0.0 {
+            match capture_account_snapshot(&client, &exchange_config.name, &grid_config.symbol, Some(reference_price), Some(iter)).await {
+                Ok(snapshot) => {
+                    let history = SnapshotHistory::new(&exchange_config.name, &grid_config.symbol);
+                    if let Err(e) = history.append_snapshot(&snapshot) {
+                        println!("⚠️  Warning: Failed to save snapshot: {}", e);
+                    }
+                }
+                Err(e) => println!("⚠️  Warning: Failed to capture snapshot: {}", e),
+            }
+        }
+    }
+
+    // Confirm before placing orders
+    if !auto_mode {
+        print!("\nPress Enter to continue with placing {} orders, or Ctrl+C to cancel: ", unified_orders.len());
+        std::io::stdin().read_line(&mut String::new())?;
+    }
+
+    // Place unified orders
+    println!("\n📝 Placing {} unified orders...", unified_orders.len());
+    let mut success_count = 0;
+    let mut fail_count = 0;
+
+    for (i, order) in unified_orders.iter().enumerate() {
+        print!("  [{}/{}] {} {} @ {:.8} (qty: {:.5}) ... ",
+            i + 1, unified_orders.len(),
+            order.side, grid_config.symbol,
+            order.price, order.quantity
+        );
+
+        // Attempt to place the order
+        match client.place_limit_order(
+            &grid_config.symbol,
+            &order.side,
+            order.quantity,
+            order.price,
+        ).await {
+            Ok(response) => {
+                println!("✅ Order ID: {}", response.order_id);
+                success_count += 1;
+            }
+            Err(e) => {
+                println!("❌ Failed: {}", e);
+                fail_count += 1;
+            }
+        }
+
+        // Small delay between orders to avoid rate limiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    println!("\n📊 Order placement summary:");
+    println!("  ✅ Successful: {}", success_count);
+    println!("  ❌ Failed: {}", fail_count);
 
     Ok(())
 }
