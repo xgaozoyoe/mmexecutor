@@ -1,4 +1,5 @@
 mod account_snapshot;
+mod adjustment;
 mod api_server;
 mod config;
 mod exchange;
@@ -8,6 +9,7 @@ mod price_calculator;
 mod state;
 
 use account_snapshot::{AccountSnapshot, AssetSnapshot, PnLAnalyzer, SnapshotHistory};
+use adjustment::{Adjustment, AdjustmentHistory, AdjustmentType};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
@@ -86,6 +88,33 @@ enum Commands {
         #[arg(short, long, default_value = "3000")]
         port: u16,
     },
+    /// 记录充值/提现（用于准确计算 PnL）
+    Adjust {
+        /// 配置文件路径
+        #[arg(default_value = "config.json")]
+        config: String,
+        /// 交易所名称（如果不指定，会提示选择）
+        #[arg(short, long)]
+        exchange: Option<String>,
+        /// 资产名称（如 USDT, BTC 等）
+        #[arg(short, long)]
+        asset: String,
+        /// 金额（正数表示充值，负数表示提现）
+        #[arg(short = 'm', long)]
+        amount: f64,
+        /// 备注
+        #[arg(short = 'n', long)]
+        note: Option<String>,
+    },
+    /// 查看充值/提现记录
+    Adjustments {
+        /// 配置文件路径
+        #[arg(default_value = "config.json")]
+        config: String,
+        /// 交易所名称（如果不指定，显示所有）
+        #[arg(short, long)]
+        exchange: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -115,6 +144,12 @@ async fn main() -> Result<()> {
         }
         Commands::Report { config, port } => {
             api_server::start_server(config, port).await?;
+        }
+        Commands::Adjust { config, exchange, asset, amount, note } => {
+            record_adjustment(&config, exchange, &asset, amount, note).await?;
+        }
+        Commands::Adjustments { config, exchange } => {
+            show_adjustments(&config, exchange).await?;
         }
     }
 
@@ -1646,6 +1681,133 @@ async fn show_trades_for_exchange(
         let profit = total_sell_value - total_buy_value;
         println!("Net profit/loss:  {:.2} USDT ({:.2}%)",
                  profit, (profit / total_buy_value) * 100.0);
+    }
+
+    Ok(())
+}
+
+/// 记录充值/提现
+async fn record_adjustment(
+    config_path: &str,
+    exchange_name: Option<String>,
+    asset: &str,
+    amount: f64,
+    note: Option<String>,
+) -> Result<()> {
+    let config = Config::from_file(config_path)?;
+
+    // 如果没有指定交易所，让用户选择
+    let exchange_name = if let Some(name) = exchange_name {
+        name
+    } else {
+        if config.exchanges.is_empty() {
+            anyhow::bail!("No exchanges configured in config file");
+        }
+
+        if config.exchanges.len() == 1 {
+            config.exchanges[0].name.clone()
+        } else {
+            println!("Please select an exchange:");
+            for (i, ex) in config.exchanges.iter().enumerate() {
+                println!("  {}. {}", i + 1, ex.name);
+            }
+            print!("Enter number (1-{}): ", config.exchanges.len());
+            std::io::stdout().flush()?;
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let choice: usize = input.trim().parse()
+                .context("Invalid number")?;
+
+            if choice < 1 || choice > config.exchanges.len() {
+                anyhow::bail!("Invalid choice");
+            }
+
+            config.exchanges[choice - 1].name.clone()
+        }
+    };
+
+    let adjustment_type = if amount > 0.0 {
+        AdjustmentType::Deposit
+    } else {
+        AdjustmentType::Withdrawal
+    };
+
+    let adjustment = Adjustment::new(
+        &exchange_name,
+        asset,
+        amount.abs(),
+        adjustment_type.clone(),
+        note.clone(),
+    );
+
+    let history = AdjustmentHistory::new(&exchange_name, &config.grid.symbol);
+    history.add_adjustment(&adjustment)?;
+
+    let type_str = match adjustment_type {
+        AdjustmentType::Deposit => "📥 Deposit",
+        AdjustmentType::Withdrawal => "📤 Withdrawal",
+    };
+
+    println!("\n✅ {} recorded successfully!", type_str);
+    println!("Exchange: {}", exchange_name);
+    println!("Asset: {}", asset);
+    println!("Amount: {:+.8}", amount);
+    if let Some(n) = note {
+        println!("Note: {}", n);
+    }
+    println!("\nThis adjustment will be excluded from P&L calculations.");
+
+    Ok(())
+}
+
+/// 显示充值/提现记录
+async fn show_adjustments(
+    config_path: &str,
+    exchange_filter: Option<String>,
+) -> Result<()> {
+    let config = Config::from_file(config_path)?;
+
+    let exchanges_to_show: Vec<String> = if let Some(ex) = exchange_filter {
+        vec![ex]
+    } else {
+        config.exchanges.iter().map(|e| e.name.clone()).collect()
+    };
+
+    let mut has_any_records = false;
+
+    for exchange_name in exchanges_to_show {
+        let history = AdjustmentHistory::new(&exchange_name, &config.grid.symbol);
+        let adjustments = history.load_all()?;
+
+        if !adjustments.is_empty() {
+            has_any_records = true;
+            println!("\n╔════════════════════════════════════════════════════════╗");
+            println!("║  Adjustments for {} - {}                    ", exchange_name, config.grid.symbol);
+            println!("╚════════════════════════════════════════════════════════╝\n");
+
+            for adj in adjustments {
+                let type_icon = match adj.adjustment_type {
+                    AdjustmentType::Deposit => "📥",
+                    AdjustmentType::Withdrawal => "📤",
+                };
+                let type_str = match adj.adjustment_type {
+                    AdjustmentType::Deposit => "Deposit  ",
+                    AdjustmentType::Withdrawal => "Withdrawal",
+                };
+
+                println!("{} {} - {}", type_icon, adj.datetime, type_str);
+                println!("   Amount: {:+.8} {}", adj.amount, adj.asset);
+                if let Some(note) = &adj.note {
+                    println!("   Note: {}", note);
+                }
+                println!();
+            }
+        }
+    }
+
+    if !has_any_records {
+        println!("No adjustment records found.");
     }
 
     Ok(())

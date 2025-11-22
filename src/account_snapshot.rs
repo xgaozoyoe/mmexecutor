@@ -6,6 +6,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::Path;
 
+use crate::adjustment::{AdjustmentHistory, AdjustmentType};
+
 /// 单个资产的快照
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetSnapshot {
@@ -149,26 +151,62 @@ impl SnapshotHistory {
 pub struct PnLAnalyzer;
 
 impl PnLAnalyzer {
-    /// 分析两个快照之间的变化
+    /// 分析两个快照之间的变化（不考虑调整）
     pub fn analyze_change(
         earlier: &AccountSnapshot,
         later: &AccountSnapshot,
         base_asset: &str,
         quote_asset: &str,
     ) -> PnLReport {
+        Self::analyze_change_with_adjustments(earlier, later, base_asset, quote_asset, None)
+    }
+
+    /// 分析两个快照之间的变化（考虑充值/提现调整）
+    pub fn analyze_change_with_adjustments(
+        earlier: &AccountSnapshot,
+        later: &AccountSnapshot,
+        base_asset: &str,
+        quote_asset: &str,
+        adjustment_history: Option<&AdjustmentHistory>,
+    ) -> PnLReport {
         let mut asset_changes = HashMap::new();
+
+        // 如果提供了调整历史，计算期间的净调整
+        let base_adjustment = if let Some(adj_history) = adjustment_history {
+            adj_history.calculate_net_adjustment(base_asset, earlier.timestamp, later.timestamp)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let quote_adjustment = if let Some(adj_history) = adjustment_history {
+            adj_history.calculate_net_adjustment(quote_asset, earlier.timestamp, later.timestamp)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
 
         // 计算资产变化
         for asset in &later.assets {
             let earlier_asset = earlier.get_asset_balance(&asset.asset);
             let earlier_total = earlier_asset.map(|a| a.total).unwrap_or(0.0);
-            let change = asset.total - earlier_total;
+            let raw_change = asset.total - earlier_total;
+
+            // 减去调整（充值/提现）
+            let adjustment = if asset.asset == base_asset {
+                base_adjustment
+            } else if asset.asset == quote_asset {
+                quote_adjustment
+            } else {
+                0.0
+            };
+            let adjusted_change = raw_change - adjustment;
 
             asset_changes.insert(asset.asset.clone(), AssetChange {
                 asset: asset.asset.clone(),
                 earlier_balance: earlier_total,
                 later_balance: asset.total,
-                change,
+                change: adjusted_change,
             });
         }
 
@@ -177,12 +215,24 @@ impl PnLAnalyzer {
         let later_value = later.calculate_total_value(base_asset, quote_asset);
 
         let value_change = match (earlier_value, later_value) {
-            (Some(e), Some(l)) => Some(ValueChange {
-                earlier_value: e,
-                later_value: l,
-                change: l - e,
-                change_percentage: ((l - e) / e) * 100.0,
-            }),
+            (Some(e), Some(l)) => {
+                // 计算调整对总价值的影响
+                let adjustment_value = if let Some(price) = later.mid_price {
+                    base_adjustment * price + quote_adjustment
+                } else {
+                    0.0
+                };
+
+                // 实际盈亏 = 总价值变化 - 调整
+                let adjusted_change = (l - e) - adjustment_value;
+
+                Some(ValueChange {
+                    earlier_value: e,
+                    later_value: l,
+                    change: adjusted_change,
+                    change_percentage: if e != 0.0 { (adjusted_change / e) * 100.0 } else { 0.0 },
+                })
+            },
             _ => None,
         };
 
@@ -192,6 +242,8 @@ impl PnLAnalyzer {
             asset_changes,
             value_change,
             time_elapsed_seconds: later.timestamp - earlier.timestamp,
+            base_adjustment,
+            quote_adjustment,
         }
     }
 
@@ -262,6 +314,8 @@ pub struct PnLReport {
     pub asset_changes: HashMap<String, AssetChange>,
     pub value_change: Option<ValueChange>,
     pub time_elapsed_seconds: i64,
+    pub base_adjustment: f64,  // base资产的充值/提现调整
+    pub quote_adjustment: f64, // quote资产的充值/提现调整
 }
 
 impl PnLReport {
@@ -277,12 +331,28 @@ impl PnLReport {
                  self.time_elapsed_seconds,
                  self.time_elapsed_seconds as f64 / 60.0);
 
+        // 显示调整信息（如果有）
+        if self.base_adjustment != 0.0 || self.quote_adjustment != 0.0 {
+            println!("\n💸 Deposits/Withdrawals (excluded from P&L):");
+            if self.base_adjustment != 0.0 {
+                let adj_type = if self.base_adjustment > 0.0 { "📥 Deposit" } else { "📤 Withdrawal" };
+                println!("  {} {}: {:+.8}", adj_type, base_asset, self.base_adjustment);
+            }
+            if self.quote_adjustment != 0.0 {
+                let adj_type = if self.quote_adjustment > 0.0 { "📥 Deposit" } else { "📤 Withdrawal" };
+                println!("  {} {}: {:+.2}", adj_type, quote_asset, self.quote_adjustment);
+            }
+        }
+
         if let Some(vc) = &self.value_change {
             println!("\n💰 Total Value Change (in {}):", quote_asset);
             println!("  Before: {:.2}", vc.earlier_value);
             println!("  After:  {:.2}", vc.later_value);
             let icon = if vc.change >= 0.0 { "📈" } else { "📉" };
-            println!("  {} Change: {:.2} ({:+.3}%)", icon, vc.change, vc.change_percentage);
+            println!("  {} Net P&L: {:.2} ({:+.3}%)", icon, vc.change, vc.change_percentage);
+            if self.base_adjustment != 0.0 || self.quote_adjustment != 0.0 {
+                println!("  ℹ️  (Adjusted for deposits/withdrawals)");
+            }
         }
 
         println!("\n🪙 Asset Changes:");
