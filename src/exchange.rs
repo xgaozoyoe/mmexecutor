@@ -45,7 +45,7 @@ pub struct OpenOrder {
     pub time: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Trade {
     pub symbol: String,
     pub id: String,
@@ -84,6 +84,17 @@ pub struct BatchOrder {
     pub side: String,
     pub quantity: f64,
     pub price: f64,
+}
+
+// 充值/提现记录
+#[derive(Debug, Clone, Deserialize)]
+pub struct DepositWithdrawal {
+    pub asset: String,           // 资产名称
+    pub amount: f64,             // 金额
+    pub transaction_type: String, // "deposit" 或 "withdrawal"
+    pub timestamp: i64,          // 时间戳（毫秒）
+    pub status: String,          // 状态（如 "completed", "pending"）
+    pub tx_id: Option<String>,   // 交易哈希/ID
 }
 
 // Exchange trait 定义所有交易所需要实现的接口
@@ -127,6 +138,42 @@ pub trait Exchange: Send + Sync {
     /// 取消订单
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<serde_json::Value>;
 
+    /// 获取充值记录（可选实现）
+    async fn get_deposit_history(
+        &self,
+        asset: Option<&str>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> Result<Vec<DepositWithdrawal>> {
+        // 默认实现：不支持
+        let _ = (asset, start_time, end_time);
+        anyhow::bail!("Deposit history API not implemented for this exchange")
+    }
+
+    /// 获取提现记录（可选实现）
+    async fn get_withdrawal_history(
+        &self,
+        asset: Option<&str>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> Result<Vec<DepositWithdrawal>> {
+        // 默认实现：不支持
+        let _ = (asset, start_time, end_time);
+        anyhow::bail!("Withdrawal history API not implemented for this exchange")
+    }
+
+    /// 获取内部转账记录（可选实现）
+    async fn get_transfer_history(
+        &self,
+        asset: Option<&str>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> Result<Vec<DepositWithdrawal>> {
+        // 默认实现：不支持
+        let _ = (asset, start_time, end_time);
+        anyhow::bail!("Transfer history API not implemented for this exchange")
+    }
+
     /// 从交易对中提取资产名称（基础资产和计价资产）
     fn get_symbol_assets(&self, symbol: &str) -> (String, String) {
         // 默认实现
@@ -151,4 +198,7 @@ pub trait Exchange: Send + Sync {
             }
         }
     }
+
+    /// 用于类型转换的辅助方法
+    fn as_any(&self) -> &dyn std::any::Any;
 }

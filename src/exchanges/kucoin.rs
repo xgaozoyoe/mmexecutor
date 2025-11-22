@@ -636,4 +636,194 @@ impl Exchange for KucoinExchange {
 
         Ok(all_results)
     }
+
+    async fn get_deposit_history(
+        &self,
+        asset: Option<&str>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> Result<Vec<DepositWithdrawal>> {
+        let timestamp = Self::get_timestamp();
+        let endpoint = "/api/v1/deposits";
+
+        // 构建查询参数
+        let mut query_params = vec![];
+        if let Some(currency) = asset {
+            query_params.push(format!("currency={}", currency));
+        }
+        if let Some(start) = start_time {
+            query_params.push(format!("startAt={}", start)); // KuCoin uses milliseconds
+        }
+        if let Some(end) = end_time {
+            query_params.push(format!("endAt={}", end));
+        }
+        query_params.push("status=SUCCESS".to_string()); // 只获取成功的充值
+
+        let query_string = if query_params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query_params.join("&"))
+        };
+
+        let full_endpoint = format!("{}{}", endpoint, query_string);
+        let signature = self.generate_signature(timestamp, "GET", &full_endpoint, "");
+        let passphrase_signature = self.generate_passphrase_signature();
+
+        let url = format!("{}{}", BASE_URL, full_endpoint);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KC-API-KEY", &self.api_key)
+            .header("KC-API-SIGN", signature)
+            .header("KC-API-TIMESTAMP", timestamp.to_string())
+            .header("KC-API-PASSPHRASE", passphrase_signature)
+            .header("KC-API-KEY-VERSION", "2")
+            .send()
+            .await
+            .context("Failed to get deposit history")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get deposit history: {}", error_text);
+        }
+
+        let response_text = response.text().await?;
+        let kucoin_response: serde_json::Value = serde_json::from_str(&response_text)
+            .context(format!("Failed to parse KuCoin response: {}", response_text))?;
+
+        // KuCoin returns: {"code":"200000","data":{"currentPage":1,"pageSize":50,"totalNum":1,"totalPage":1,"items":[...]}}
+        if let Some(data) = kucoin_response.get("data") {
+            if let Some(items) = data.get("items").and_then(|i| i.as_array()) {
+                let result = items
+                    .iter()
+                    .filter_map(|item| {
+                        let currency = item.get("currency")?.as_str()?.to_string();
+                        let amount = item.get("amount")?.as_str()?.parse::<f64>().ok()?;
+                        let created_at = item.get("createdAt")?.as_i64()?;
+                        let status = item.get("status")?.as_str()?.to_string();
+                        let address = item.get("address").and_then(|a| a.as_str()).map(|s| s.to_string());
+
+                        Some(DepositWithdrawal {
+                            asset: currency,
+                            amount,
+                            transaction_type: "deposit".to_string(),
+                            timestamp: created_at,
+                            status,
+                            tx_id: address,
+                        })
+                    })
+                    .collect();
+
+                Ok(result)
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn get_withdrawal_history(
+        &self,
+        asset: Option<&str>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> Result<Vec<DepositWithdrawal>> {
+        let timestamp = Self::get_timestamp();
+        let endpoint = "/api/v1/withdrawals";
+
+        // 构建查询参数
+        let mut query_params = vec![];
+        if let Some(currency) = asset {
+            query_params.push(format!("currency={}", currency));
+        }
+        if let Some(start) = start_time {
+            query_params.push(format!("startAt={}", start)); // KuCoin uses milliseconds
+        }
+        if let Some(end) = end_time {
+            query_params.push(format!("endAt={}", end));
+        }
+        query_params.push("status=SUCCESS".to_string()); // 只获取成功的提现
+
+        let query_string = if query_params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", query_params.join("&"))
+        };
+
+        let full_endpoint = format!("{}{}", endpoint, query_string);
+        let signature = self.generate_signature(timestamp, "GET", &full_endpoint, "");
+        let passphrase_signature = self.generate_passphrase_signature();
+
+        let url = format!("{}{}", BASE_URL, full_endpoint);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KC-API-KEY", &self.api_key)
+            .header("KC-API-SIGN", signature)
+            .header("KC-API-TIMESTAMP", timestamp.to_string())
+            .header("KC-API-PASSPHRASE", passphrase_signature)
+            .header("KC-API-KEY-VERSION", "2")
+            .send()
+            .await
+            .context("Failed to get withdrawal history")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get withdrawal history: {}", error_text);
+        }
+
+        let response_text = response.text().await?;
+        let kucoin_response: serde_json::Value = serde_json::from_str(&response_text)
+            .context(format!("Failed to parse KuCoin response: {}", response_text))?;
+
+        // KuCoin returns: {"code":"200000","data":{"currentPage":1,"pageSize":50,"totalNum":1,"totalPage":1,"items":[...]}}
+        if let Some(data) = kucoin_response.get("data") {
+            if let Some(items) = data.get("items").and_then(|i| i.as_array()) {
+                let result = items
+                    .iter()
+                    .filter_map(|item| {
+                        let currency = item.get("currency")?.as_str()?.to_string();
+                        let amount = item.get("amount")?.as_str()?.parse::<f64>().ok()?;
+                        let created_at = item.get("createdAt")?.as_i64()?;
+                        let status = item.get("status")?.as_str()?.to_string();
+                        let wallet_tx_id = item.get("walletTxId").and_then(|a| a.as_str()).map(|s| s.to_string());
+
+                        Some(DepositWithdrawal {
+                            asset: currency,
+                            amount,
+                            transaction_type: "withdrawal".to_string(),
+                            timestamp: created_at,
+                            status,
+                            tx_id: wallet_tx_id,
+                        })
+                    })
+                    .collect();
+
+                Ok(result)
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn get_transfer_history(
+        &self,
+        _asset: Option<&str>,
+        _start_time: Option<i64>,
+        _end_time: Option<i64>,
+    ) -> Result<Vec<DepositWithdrawal>> {
+        // KuCoin 的内部转账历史 API 比较复杂，需要使用不同的端点
+        // 暂时返回空列表，或者返回不支持的错误
+        // 如果需要实现，可以使用 /api/v1/accounts/transferable 等端点
+        anyhow::bail!("Transfer history not implemented for KuCoin yet")
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

@@ -339,4 +339,159 @@ impl Exchange for MexcExchange {
         serde_json::from_str(&response_text)
             .context(format!("Failed to parse cancel order response. Raw response: {}", response_text))
     }
+
+    async fn get_deposit_history(
+        &self,
+        asset: Option<&str>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> Result<Vec<DepositWithdrawal>> {
+        let timestamp = Self::get_timestamp();
+        let mut query_string = format!("timestamp={}", timestamp);
+
+        if let Some(a) = asset {
+            query_string = format!("coin={}&{}", a, query_string);
+        }
+        if let Some(st) = start_time {
+            query_string = format!("{}&startTime={}", query_string, st);
+        }
+        if let Some(et) = end_time {
+            query_string = format!("{}&endTime={}", query_string, et);
+        }
+
+        let signature = self.generate_signature(&query_string);
+        let url = format!("{}/api/v3/capital/deposit/hisrec?{}&signature={}", BASE_URL, query_string, signature);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-MEXC-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("Failed to get deposit history")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get deposit history: {}", error_text);
+        }
+
+        let response_text = response.text().await?;
+
+        #[derive(Debug, Deserialize)]
+        struct MexcDeposit {
+            coin: String,
+            amount: String,
+            #[serde(rename = "insertTime")]
+            insert_time: i64,
+            status: i32,
+            #[serde(rename = "txId")]
+            tx_id: Option<String>,
+        }
+
+        let deposits: Vec<MexcDeposit> = serde_json::from_str(&response_text)
+            .context(format!("Failed to parse deposit history. Raw response: {}", response_text))?;
+
+        let result = deposits
+            .into_iter()
+            .map(|d| {
+                let status = match d.status {
+                    0 => "pending",
+                    1 => "completed",
+                    _ => "unknown",
+                };
+                DepositWithdrawal {
+                    asset: d.coin,
+                    amount: d.amount.parse().unwrap_or(0.0),
+                    transaction_type: "deposit".to_string(),
+                    timestamp: d.insert_time,
+                    status: status.to_string(),
+                    tx_id: d.tx_id,
+                }
+            })
+            .collect();
+
+        Ok(result)
+    }
+
+    async fn get_withdrawal_history(
+        &self,
+        asset: Option<&str>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> Result<Vec<DepositWithdrawal>> {
+        let timestamp = Self::get_timestamp();
+        let mut query_string = format!("timestamp={}", timestamp);
+
+        if let Some(a) = asset {
+            query_string = format!("coin={}&{}", a, query_string);
+        }
+        if let Some(st) = start_time {
+            query_string = format!("{}&startTime={}", query_string, st);
+        }
+        if let Some(et) = end_time {
+            query_string = format!("{}&endTime={}", query_string, et);
+        }
+
+        let signature = self.generate_signature(&query_string);
+        let url = format!("{}/api/v3/capital/withdraw/history?{}&signature={}", BASE_URL, query_string, signature);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-MEXC-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("Failed to get withdrawal history")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get withdrawal history: {}", error_text);
+        }
+
+        let response_text = response.text().await?;
+
+        #[derive(Debug, Deserialize)]
+        struct MexcWithdrawal {
+            coin: String,
+            amount: String,
+            #[serde(rename = "applyTime")]
+            apply_time: i64,
+            status: i32,
+            #[serde(rename = "txId")]
+            tx_id: Option<String>,
+        }
+
+        let withdrawals: Vec<MexcWithdrawal> = serde_json::from_str(&response_text)
+            .context(format!("Failed to parse withdrawal history. Raw response: {}", response_text))?;
+
+        let result = withdrawals
+            .into_iter()
+            .map(|w| {
+                let status = match w.status {
+                    0 => "email_sent",
+                    1 => "cancelled",
+                    2 => "awaiting_approval",
+                    3 => "rejected",
+                    4 => "processing",
+                    5 => "failure",
+                    6 => "completed",
+                    _ => "unknown",
+                };
+                DepositWithdrawal {
+                    asset: w.coin,
+                    amount: w.amount.parse().unwrap_or(0.0),
+                    transaction_type: "withdrawal".to_string(),
+                    timestamp: w.apply_time,
+                    status: status.to_string(),
+                    tx_id: w.tx_id,
+                }
+            })
+            .collect();
+
+        Ok(result)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

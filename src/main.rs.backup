@@ -1668,6 +1668,341 @@ async fn show_trades_for_exchange(
     Ok(())
 }
 
+/// 记录充值/提现
+async fn record_adjustment(
+    config_path: &str,
+    exchange_name: Option<String>,
+    asset: &str,
+    amount: f64,
+    note: Option<String>,
+) -> Result<()> {
+    let config = Config::from_file(config_path)?;
+
+    // 如果没有指定交易所，让用户选择
+    let exchange_name = if let Some(name) = exchange_name {
+        name
+    } else {
+        if config.exchanges.is_empty() {
+            anyhow::bail!("No exchanges configured in config file");
+        }
+
+        if config.exchanges.len() == 1 {
+            config.exchanges[0].name.clone()
+        } else {
+            println!("Please select an exchange:");
+            for (i, ex) in config.exchanges.iter().enumerate() {
+                println!("  {}. {}", i + 1, ex.name);
+            }
+            print!("Enter number (1-{}): ", config.exchanges.len());
+            std::io::stdout().flush()?;
+
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let choice: usize = input.trim().parse()
+                .context("Invalid number")?;
+
+            if choice < 1 || choice > config.exchanges.len() {
+                anyhow::bail!("Invalid choice");
+            }
+
+            config.exchanges[choice - 1].name.clone()
+        }
+    };
+
+    let adjustment_type = if amount > 0.0 {
+        AdjustmentType::Deposit
+    } else {
+        AdjustmentType::Withdrawal
+    };
+
+    let adjustment = Adjustment::new(
+        &exchange_name,
+        asset,
+        amount.abs(),
+        adjustment_type.clone(),
+        note.clone(),
+    );
+
+    let history = AdjustmentHistory::new(&exchange_name, &config.grid.symbol);
+    history.add_adjustment(&adjustment)?;
+
+    let type_str = match adjustment_type {
+        AdjustmentType::Deposit => "📥 Deposit",
+        AdjustmentType::Withdrawal => "📤 Withdrawal",
+    };
+
+    println!("\n✅ {} recorded successfully!", type_str);
+    println!("Exchange: {}", exchange_name);
+    println!("Asset: {}", asset);
+    println!("Amount: {:+.8}", amount);
+    if let Some(n) = note {
+        println!("Note: {}", n);
+    }
+    println!("\nThis adjustment will be excluded from P&L calculations.");
+
+    Ok(())
+}
+
+/// 显示充值/提现记录
+async fn show_adjustments(
+    config_path: &str,
+    exchange_filter: Option<String>,
+) -> Result<()> {
+    let config = Config::from_file(config_path)?;
+
+    let exchanges_to_show: Vec<String> = if let Some(ex) = exchange_filter {
+        vec![ex]
+    } else {
+        config.exchanges.iter().map(|e| e.name.clone()).collect()
+    };
+
+    let mut has_any_records = false;
+
+    for exchange_name in exchanges_to_show {
+        let history = AdjustmentHistory::new(&exchange_name, &config.grid.symbol);
+        let adjustments = history.load_all()?;
+
+        if !adjustments.is_empty() {
+            has_any_records = true;
+            println!("\n╔════════════════════════════════════════════════════════╗");
+            println!("║  Adjustments for {} - {}                    ", exchange_name, config.grid.symbol);
+            println!("╚════════════════════════════════════════════════════════╝\n");
+
+            for adj in adjustments {
+                let type_icon = match adj.adjustment_type {
+                    AdjustmentType::Deposit => "📥",
+                    AdjustmentType::Withdrawal => "📤",
+                };
+                let type_str = match adj.adjustment_type {
+                    AdjustmentType::Deposit => "Deposit  ",
+                    AdjustmentType::Withdrawal => "Withdrawal",
+                };
+
+                println!("{} {} - {}", type_icon, adj.datetime, type_str);
+                println!("   Amount: {:+.8} {}", adj.amount, adj.asset);
+                if let Some(note) = &adj.note {
+                    println!("   Note: {}", note);
+                }
+                println!();
+            }
+        }
+    }
+
+    if !has_any_records {
+        println!("No adjustment records found.");
+    }
+
+    Ok(())
+}
+
+/// 从交易所API同步充值/提现记录
+async fn sync_adjustments_from_api(
+    config_path: &str,
+    exchange_filter: Option<String>,
+    from_snapshot: bool,
+) -> Result<()> {
+    use crate::exchange::DepositWithdrawal;
+
+    println!("\n╔════════════════════════════════════════════════════════╗");
+    println!("║     SYNCING DEPOSITS/WITHDRAWALS FROM API             ║");
+    println!("╚════════════════════════════════════════════════════════╝\n");
+
+    let config = Config::from_file(config_path)?;
+
+    let exchanges_to_sync: Vec<_> = if let Some(ex) = exchange_filter {
+        config.exchanges.iter().filter(|e| e.name == ex).collect()
+    } else {
+        config.exchanges.iter().collect()
+    };
+
+    if exchanges_to_sync.is_empty() {
+        anyhow::bail!("No matching exchanges found");
+    }
+
+    for exchange_config in exchanges_to_sync {
+        let exchange_name = &exchange_config.name;
+        println!("📊 Processing {} ...", exchange_name);
+        println!("{}", "-".repeat(60));
+
+        // 创建交易所客户端
+        let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_name))
+            .context(format!("Invalid exchange type: {}", exchange_name))?;
+
+        let client = create_exchange(
+            &exchange_type,
+            exchange_config.api_key.clone(),
+            exchange_config.api_secret.clone(),
+            exchange_config.api_passphrase.clone(),
+        )?;
+
+        // 确定时间范围
+        let (start_time, end_time) = if from_snapshot {
+            // 从第一个快照开始
+            let snapshot_history = SnapshotHistory::new(exchange_name, &config.grid.symbol);
+            let snapshots = snapshot_history.load_all()?;
+            
+            if let Some(first) = snapshots.first() {
+                println!("  📅 Using first snapshot time: {}", first.datetime);
+                println!("  ⏰ Syncing from: {} to now", first.datetime);
+                (Some(first.timestamp * 1000), None) // 转换为毫秒
+            } else {
+                println!("  ⚠️  No snapshots found, syncing last 30 days");
+                let thirty_days_ago = (chrono::Utc::now() - chrono::Duration::days(30)).timestamp() * 1000;
+                (Some(thirty_days_ago), None)
+            }
+        } else {
+            println!("  ⏰ Syncing last 30 days");
+            let thirty_days_ago = (chrono::Utc::now() - chrono::Duration::days(30)).timestamp() * 1000;
+            (Some(thirty_days_ago), None)
+        };
+
+        // 获取交易对的资产
+        let (base_asset, quote_asset) = client.get_symbol_assets(&config.grid.symbol);
+        let assets_to_sync = vec![base_asset.clone(), quote_asset.clone()];
+
+        let mut total_synced = 0;
+        let adj_history = AdjustmentHistory::new(exchange_name, &config.grid.symbol);
+
+        // 获取已有的调整记录（避免重复）
+        let existing_adjustments = adj_history.load_all()?;
+        let existing_timestamps: std::collections::HashSet<i64> = existing_adjustments
+            .iter()
+            .map(|adj| adj.timestamp)
+            .collect();
+
+        for asset in &assets_to_sync {
+            println!("\n  💰 Syncing {} ...", asset);
+
+            // 获取充值记录
+            match client.get_deposit_history(Some(asset), start_time, end_time).await {
+                Ok(deposits) => {
+                    println!("    📥 Found {} deposit(s)", deposits.len());
+                    for dep in deposits {
+                        if dep.status.to_lowercase() != "completed" && dep.status != "1" {
+                            continue; // 跳过未完成的充值
+                        }
+
+                        let timestamp = dep.timestamp / 1000; // 转换为秒
+                        if existing_timestamps.contains(&timestamp) {
+                            continue; // 跳过已存在的记录
+                        }
+
+                        let adjustment = Adjustment::new(
+                            exchange_name,
+                            asset,
+                            dep.amount,
+                            AdjustmentType::Deposit,
+                            Some(format!("Auto-synced from API, TxID: {}", 
+                                dep.tx_id.as_deref().unwrap_or("N/A"))),
+                        );
+
+                        adj_history.add_adjustment(&adjustment)?;
+                        total_synced += 1;
+                        println!("      ✅ +{:.8} {} at {}", dep.amount, asset, 
+                            chrono::DateTime::from_timestamp(timestamp, 0)
+                                .unwrap_or_default()
+                                .format("%Y-%m-%d %H:%M:%S UTC"));
+                    }
+                }
+                Err(e) => {
+                    println!("    ⚠️  Could not fetch deposits: {}", e);
+                }
+            }
+
+            // 获取提现记录
+            match client.get_withdrawal_history(Some(asset), start_time, end_time).await {
+                Ok(withdrawals) => {
+                    println!("    📤 Found {} withdrawal(s)", withdrawals.len());
+                    for wd in withdrawals {
+                        if wd.status.to_lowercase() != "completed" && wd.status != "6" {
+                            continue; // 跳过未完成的提现
+                        }
+
+                        let timestamp = wd.timestamp / 1000; // 转换为秒
+                        if existing_timestamps.contains(&timestamp) {
+                            continue; // 跳过已存在的记录
+                        }
+
+                        let adjustment = Adjustment::new(
+                            exchange_name,
+                            asset,
+                            wd.amount,
+                            AdjustmentType::Withdrawal,
+                            Some(format!("Auto-synced from API, TxID: {}",
+                                wd.tx_id.as_deref().unwrap_or("N/A"))),
+                        );
+
+                        adj_history.add_adjustment(&adjustment)?;
+                        total_synced += 1;
+                        println!("      ✅ -{:.8} {} at {}", wd.amount, asset,
+                            chrono::DateTime::from_timestamp(timestamp, 0)
+                                .unwrap_or_default()
+                                .format("%Y-%m-%d %H:%M:%S UTC"));
+                    }
+                }
+                Err(e) => {
+                    println!("    ⚠️  Could not fetch withdrawals: {}", e);
+                }
+            }
+
+            // 获取内部转账记录
+            match client.get_transfer_history(Some(asset), start_time, end_time).await {
+                Ok(transfers) => {
+                    println!("    🔄 Found {} transfer(s)", transfers.len());
+                    for tf in transfers {
+                        if tf.status.to_lowercase() != "completed" {
+                            continue; // 跳过未完成的转账
+                        }
+
+                        let timestamp = tf.timestamp / 1000; // 转换为秒
+                        if existing_timestamps.contains(&timestamp) {
+                            continue; // 跳过已存在的记录
+                        }
+
+                        // 根据 transaction_type 判断是转入还是转出
+                        let adjustment_type = if tf.transaction_type == "transfer_in" {
+                            AdjustmentType::Deposit
+                        } else {
+                            AdjustmentType::Withdrawal
+                        };
+
+                        let adjustment = Adjustment::new(
+                            exchange_name,
+                            asset,
+                            tf.amount,
+                            adjustment_type,
+                            Some(format!("Auto-synced transfer from API, ID: {}",
+                                tf.tx_id.as_deref().unwrap_or("N/A"))),
+                        );
+
+                        adj_history.add_adjustment(&adjustment)?;
+                        total_synced += 1;
+                        let sign = if tf.transaction_type == "transfer_in" { "+" } else { "-" };
+                        println!("      ✅ {}{:.8} {} at {} ({})", sign, tf.amount, asset,
+                            chrono::DateTime::from_timestamp(timestamp, 0)
+                                .unwrap_or_default()
+                                .format("%Y-%m-%d %H:%M:%S UTC"),
+                            tf.transaction_type);
+                    }
+                }
+                Err(e) => {
+                    println!("    ⚠️  Could not fetch transfers: {}", e);
+                }
+            }
+        }
+
+        println!("\n  ✅ Synced {} new record(s) for {}", total_synced, exchange_name);
+        println!();
+    }
+
+    println!("{}", "═".repeat(60));
+    println!("✅ Sync complete!");
+    println!("💡 Run 'adjustments' command to view all records");
+    println!("{}", "═".repeat(60));
+
+    Ok(())
+}
+
 /// 显示交易统计
 async fn show_trade_stats(
     config_path: &str,

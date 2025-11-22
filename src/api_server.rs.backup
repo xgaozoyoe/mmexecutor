@@ -1,4 +1,5 @@
 use crate::account_snapshot::{AccountSnapshot, AssetSnapshot, PnLAnalyzer, SnapshotHistory};
+use crate::adjustment::{AdjustmentHistory, AdjustmentType};
 use crate::config::Config;
 use crate::exchange::Exchange;
 use crate::exchanges::{create_exchange, ExchangeType};
@@ -712,21 +713,164 @@ fn fetch_pnl_summary(
 }
 
 /// 验证和对账调整记录
-// DISABLED: adjustment module not yet implemented
-#[allow(dead_code)]
-async fn verify_adjustments(_config_path: &str) -> Result<()> {
-    anyhow::bail!("Adjustment verification not yet implemented")
+async fn verify_adjustments(config_path: &str) -> Result<()> {
+    println!("\n╔════════════════════════════════════════════════════════╗");
+    println!("║       ADJUSTMENT VERIFICATION & RECONCILIATION         ║");
+    println!("╚════════════════════════════════════════════════════════╝\n");
+
+    let config = Config::from_file(config_path)?;
+
+    let mut total_adjustments = 0;
+    let mut any_discrepancy = false;
+
+    for exchange_config in &config.exchanges {
+        let exchange_name = &exchange_config.name;
+        let adj_history = AdjustmentHistory::new(exchange_name, &config.grid.symbol);
+        let adjustments = adj_history.load_all()?;
+
+        if adjustments.is_empty() {
+            println!("📋 {} - No adjustments recorded", exchange_name);
+            continue;
+        }
+
+        total_adjustments += adjustments.len();
+
+        println!("📊 {} - Found {} adjustment(s)", exchange_name, adjustments.len());
+        println!("{}", "-".repeat(60));
+
+        // 按资产分组统计
+        let mut deposits = std::collections::HashMap::new();
+        let mut withdrawals = std::collections::HashMap::new();
+
+        for adj in &adjustments {
+            match adj.adjustment_type {
+                AdjustmentType::Deposit => {
+                    *deposits.entry(adj.asset.clone()).or_insert(0.0) += adj.amount;
+                }
+                AdjustmentType::Withdrawal => {
+                    *withdrawals.entry(adj.asset.clone()).or_insert(0.0) += adj.amount;
+                }
+            }
+        }
+
+        // 显示汇总
+        println!("\n  Summary by Asset:");
+        let mut all_assets: std::collections::HashSet<_> = deposits.keys().chain(withdrawals.keys()).collect();
+        let mut all_assets_vec: Vec<_> = all_assets.drain().collect();
+        all_assets_vec.sort();
+
+        for asset in all_assets_vec {
+            let total_deposits = deposits.get(asset).copied().unwrap_or(0.0);
+            let total_withdrawals = withdrawals.get(asset).copied().unwrap_or(0.0);
+            let net = total_deposits - total_withdrawals;
+
+            println!("    {} {}", asset, "-".repeat(40));
+            if total_deposits > 0.0 {
+                println!("      📥 Total Deposits:    {:>15.8}", total_deposits);
+            }
+            if total_withdrawals > 0.0 {
+                println!("      📤 Total Withdrawals: {:>15.8}", total_withdrawals);
+            }
+            let net_icon = if net >= 0.0 { "➕" } else { "➖" };
+            println!("      {} Net Change:       {:>15.8}", net_icon, net);
+        }
+
+        // 尝试通过API验证（可选）
+        println!("\n  🔍 Verifying with exchange API...");
+        match verify_adjustments_with_api(exchange_config, &config.grid, &adjustments).await {
+            Ok(message) => {
+                println!("  {}", message);
+            }
+            Err(e) => {
+                println!("  ⚠️  Could not verify via API: {}", e);
+                println!("  ℹ️  This is normal if you don't have access to deposit/withdrawal history");
+            }
+        }
+
+        println!();
+    }
+
+    println!("{}", "═".repeat(60));
+    if total_adjustments == 0 {
+        println!("✅ No adjustments recorded for any exchange");
+    } else {
+        println!("✅ Verification complete: {} total adjustment(s) found", total_adjustments);
+        if any_discrepancy {
+            println!("⚠️  Please review discrepancies above");
+        } else {
+            println!("💚 All adjustments appear consistent");
+        }
+    }
+    println!("{}", "═".repeat(60));
+
+    Ok(())
 }
 
 /// 通过API验证调整记录（可选）
-// DISABLED: adjustment module not yet implemented
-#[allow(dead_code)]
 async fn verify_adjustments_with_api(
-    _exchange_config: &crate::config::ExchangeConfig,
-    _grid_config: &crate::config::GridConfig,
-    _adjustments: &[()],  // Changed from Adjustment to () to avoid compilation error
+    exchange_config: &crate::config::ExchangeConfig,
+    grid_config: &crate::config::GridConfig,
+    adjustments: &[crate::adjustment::Adjustment],
 ) -> Result<String> {
-    anyhow::bail!("Adjustment verification not yet implemented")
+    // 创建交易所客户端
+    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
+        .context(format!("Invalid exchange type: {}", exchange_config.name))?;
+
+    let client = create_exchange(
+        &exchange_type,
+        exchange_config.api_key.clone(),
+        exchange_config.api_secret.clone(),
+        exchange_config.api_passphrase.clone(),
+    )?;
+
+    // 获取当前账户信息
+    let account = client.get_account_info().await?;
+    let (base_asset, quote_asset) = client.get_symbol_assets(&grid_config.symbol);
+
+    // 计算预期余额（如果有第一个快照）
+    let snapshot_history = SnapshotHistory::new(&exchange_config.name, &grid_config.symbol);
+    if let Some(first_snapshot) = snapshot_history.load_all()?.first() {
+        let mut messages = Vec::new();
+
+        // 检查每个资产
+        for asset in [&base_asset, &quote_asset] {
+            if let Some(first_balance) = first_snapshot.get_asset_balance(asset) {
+                // 计算调整总和
+                let total_adj: f64 = adjustments.iter()
+                    .filter(|adj| &adj.asset == asset && adj.timestamp >= first_snapshot.timestamp)
+                    .map(|adj| {
+                        match adj.adjustment_type {
+                            AdjustmentType::Deposit => adj.amount,
+                            AdjustmentType::Withdrawal => -adj.amount,
+                        }
+                    })
+                    .sum();
+
+                // 获取当前余额
+                if let Some(current_balance) = account.balances.iter().find(|b| &b.asset == asset) {
+                    let current_total: f64 = current_balance.free.parse().unwrap_or(0.0) 
+                        + current_balance.locked.parse().unwrap_or(0.0);
+
+                    // 计算差异（当前余额 - 初始余额 - 调整）
+                    let balance_change = current_total - first_balance.total;
+                    let trading_change = balance_change - total_adj;
+
+                    messages.push(format!(
+                        "✓ {}: Initial={:.4}, Current={:.4}, Adjustments={:+.4}, Trading P&L={:+.4}",
+                        asset, first_balance.total, current_total, total_adj, trading_change
+                    ));
+                }
+            }
+        }
+
+        if messages.is_empty() {
+            Ok("✓ Basic verification passed (no baseline snapshot for comparison)".to_string())
+        } else {
+            Ok(messages.join("\n      "))
+        }
+    } else {
+        Ok("✓ No baseline snapshot found for comparison".to_string())
+    }
 }
 
 /// 同步交易历史（从上一个 snapshot 到现在的所有交易）

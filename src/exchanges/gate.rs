@@ -478,18 +478,27 @@ impl Exchange for GateExchange {
 
         let trades: Vec<Trade> = gate_trades
             .into_iter()
-            .map(|v| Trade {
-                symbol: v["currency_pair"].as_str().unwrap_or("").replace("_", ""),
-                id: v["id"].as_str().unwrap_or("").to_string(),
-                order_id: v["order_id"].as_str().unwrap_or("").to_string(),
-                price: v["price"].as_str().unwrap_or("0").to_string(),
-                qty: v["amount"].as_str().unwrap_or("0").to_string(),
-                quote_qty: v["role"].as_str().unwrap_or("0").to_string(),
-                commission: v["fee"].as_str().unwrap_or("0").to_string(),
-                commission_asset: v["fee_currency"].as_str().unwrap_or("").to_string(),
-                time: v["create_time"].as_i64().unwrap_or(0) * 1000,
-                is_buyer: v["side"].as_str().unwrap_or("") == "buy",
-                is_maker: v["role"].as_str().unwrap_or("") == "maker",
+            .map(|v| {
+                // Gate.io create_time 可能是字符串或整数
+                let time_ms = if let Some(time_str) = v["create_time"].as_str() {
+                    time_str.parse::<i64>().unwrap_or(0) * 1000
+                } else {
+                    v["create_time"].as_i64().unwrap_or(0) * 1000
+                };
+
+                Trade {
+                    symbol: v["currency_pair"].as_str().unwrap_or("").replace("_", ""),
+                    id: v["id"].as_str().unwrap_or("").to_string(),
+                    order_id: v["order_id"].as_str().unwrap_or("").to_string(),
+                    price: v["price"].as_str().unwrap_or("0").to_string(),
+                    qty: v["amount"].as_str().unwrap_or("0").to_string(),
+                    quote_qty: v["role"].as_str().unwrap_or("0").to_string(),
+                    commission: v["fee"].as_str().unwrap_or("0").to_string(),
+                    commission_asset: v["fee_currency"].as_str().unwrap_or("").to_string(),
+                    time: time_ms,
+                    is_buyer: v["side"].as_str().unwrap_or("") == "buy",
+                    is_maker: v["role"].as_str().unwrap_or("") == "maker",
+                }
             })
             .collect();
 
@@ -649,5 +658,121 @@ impl Exchange for GateExchange {
         }
 
         Ok(all_results)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl GateExchange {
+    /// Gate.io专用：支持时间范围查询的交易记录获取
+    /// from_time: 开始时间（Unix时间戳，毫秒）
+    /// to_time: 结束时间（Unix时间戳，毫秒）
+    /// 如果交易量大，会自动分页获取所有交易
+    pub async fn get_my_trades_with_time_range(
+        &self,
+        symbol: &str,
+        from_time: Option<i64>,
+        to_time: Option<i64>,
+    ) -> Result<Vec<Trade>> {
+        let timestamp = Self::get_timestamp();
+        let url_path = "/api/v4/spot/my_trades";
+
+        let gate_symbol = symbol.replace("USDT", "_USDT")
+            .replace("USDC", "_USDC")
+            .replace("BTC", "_BTC")
+            .replace("ETH", "_ETH");
+
+        let mut all_trades = Vec::new();
+        let mut page = 1;
+        let limit = 1000; // 每页获取1000条（Gate.io最大值）
+
+        loop {
+            let mut query_params = vec![
+                format!("currency_pair={}", gate_symbol),
+                format!("limit={}", limit),
+                format!("page={}", page),
+            ];
+
+            // 添加时间范围参数（Gate.io API 使用秒级时间戳）
+            if let Some(from) = from_time {
+                query_params.push(format!("from={}", from / 1000));
+            }
+            if let Some(to) = to_time {
+                query_params.push(format!("to={}", to / 1000));
+            }
+
+            let query_string = query_params.join("&");
+
+            let body_hash = format!("{:x}", sha2::Sha512::digest(b""));
+            let signature = self.generate_signature("GET", url_path, &query_string, &body_hash, timestamp);
+
+            let url = format!("{}{}?{}", BASE_URL, url_path, query_string);
+
+            let response = self
+                .client
+                .get(&url)
+                .header("KEY", &self.api_key)
+                .header("Timestamp", timestamp.to_string())
+                .header("SIGN", signature)
+                .send()
+                .await
+                .context("Failed to get my trades")?;
+
+            if !response.status().is_success() {
+                let error_text = response.text().await?;
+                anyhow::bail!("Failed to get my trades: {}", error_text);
+            }
+
+            let gate_trades: Vec<serde_json::Value> = response
+                .json()
+                .await
+                .context("Failed to parse my trades")?;
+
+            let trades_count = gate_trades.len();
+
+            let trades: Vec<Trade> = gate_trades
+                .into_iter()
+                .map(|v| {
+                    // Gate.io create_time 可能是字符串或整数
+                    let time_ms = if let Some(time_str) = v["create_time"].as_str() {
+                        time_str.parse::<i64>().unwrap_or(0) * 1000
+                    } else {
+                        v["create_time"].as_i64().unwrap_or(0) * 1000
+                    };
+
+                    Trade {
+                        symbol: v["currency_pair"].as_str().unwrap_or("").replace("_", ""),
+                        id: v["id"].as_str().unwrap_or("").to_string(),
+                        order_id: v["order_id"].as_str().unwrap_or("").to_string(),
+                        price: v["price"].as_str().unwrap_or("0").to_string(),
+                        qty: v["amount"].as_str().unwrap_or("0").to_string(),
+                        quote_qty: v["role"].as_str().unwrap_or("0").to_string(),
+                        commission: v["fee"].as_str().unwrap_or("0").to_string(),
+                        commission_asset: v["fee_currency"].as_str().unwrap_or("").to_string(),
+                        time: time_ms,
+                        is_buyer: v["side"].as_str().unwrap_or("") == "buy",
+                        is_maker: v["role"].as_str().unwrap_or("") == "maker",
+                    }
+                })
+                .collect();
+
+            all_trades.extend(trades);
+
+            // 如果返回的交易数量小于limit，说明已经获取完所有交易
+            if trades_count < limit {
+                break;
+            }
+
+            page += 1;
+
+            // 防止无限循环，最多获取10页
+            if page > 10 {
+                break;
+            }
+        }
+
+        Ok(all_trades)
     }
 }
