@@ -250,28 +250,43 @@ impl Exchange for GateExchange {
             .context("Failed to parse open orders response")?;
 
         // Extract the orders array from the response
-        let gate_orders = if response_value.is_array() {
+        let mut gate_orders = Vec::new();
+
+        if response_value.is_array() {
             let arr = response_value.as_array().unwrap();
             if !arr.is_empty() && arr[0].get("orders").is_some() {
                 // New format: array containing wrapper object(s) with "orders" field
                 // Example: [{"currency_pair":"ZKWASM_USDT","total":7,"orders":[...]}]
-                arr[0].get("orders")
-                    .and_then(|orders| orders.as_array())
-                    .unwrap_or(&vec![])
-                    .clone()
+                // When requesting specific symbol, filter by currency_pair to avoid cross-contamination
+                for wrapper in arr {
+                    // Check if this wrapper is for the requested symbol
+                    if let Some(sym) = symbol {
+                        let gate_symbol = sym.replace("USDT", "_USDT")
+                            .replace("USDC", "_USDC")
+                            .replace("BTC", "_BTC")
+                            .replace("ETH", "_ETH");
+                        let pair = wrapper.get("currency_pair")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("");
+                        if pair != gate_symbol {
+                            continue; // Skip this wrapper, it's for a different symbol
+                        }
+                    }
+
+                    if let Some(orders) = wrapper.get("orders").and_then(|o| o.as_array()) {
+                        gate_orders.extend_from_slice(orders);
+                    }
+                }
             } else {
                 // Old format: direct array of orders
-                arr.clone()
+                gate_orders = arr.clone();
             }
         } else if let Some(orders) = response_value.get("orders") {
             // Alternative format: single wrapper object with "orders" field
-            orders.as_array()
+            gate_orders = orders.as_array()
                 .context("'orders' field is not an array")?
-                .clone()
-        } else {
-            // Fallback to empty array
-            vec![]
-        };
+                .clone();
+        }
 
         let open_orders: Vec<OpenOrder> = gate_orders
             .into_iter()
@@ -486,13 +501,18 @@ impl Exchange for GateExchange {
                     v["create_time"].as_i64().unwrap_or(0) * 1000
                 };
 
+                // Calculate quote_qty from price * amount
+                let price_f64 = v["price"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+                let amount_f64 = v["amount"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+                let quote_qty = (price_f64 * amount_f64).to_string();
+
                 Trade {
                     symbol: v["currency_pair"].as_str().unwrap_or("").replace("_", ""),
                     id: v["id"].as_str().unwrap_or("").to_string(),
                     order_id: v["order_id"].as_str().unwrap_or("").to_string(),
                     price: v["price"].as_str().unwrap_or("0").to_string(),
                     qty: v["amount"].as_str().unwrap_or("0").to_string(),
-                    quote_qty: v["role"].as_str().unwrap_or("0").to_string(),
+                    quote_qty,
                     commission: v["fee"].as_str().unwrap_or("0").to_string(),
                     commission_asset: v["fee_currency"].as_str().unwrap_or("").to_string(),
                     time: time_ms,

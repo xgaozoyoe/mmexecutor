@@ -116,6 +116,21 @@ pub struct PnLSummary {
     pub duration_seconds: i64,
     pub quote_asset_summary: AssetSummary,
     pub base_asset_summary: AssetSummary,
+    pub trade_stats: Option<TradeStatsSummary>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TradeStatsSummary {
+    pub avg_buy_price: f64,
+    pub avg_sell_price: f64,
+    pub total_buy_quantity: f64,
+    pub total_sell_quantity: f64,
+    pub total_buy_cost: f64,
+    pub total_sell_revenue: f64,
+    pub buy_count: usize,
+    pub sell_count: usize,
+    pub net_quantity: f64,
+    pub realized_pnl: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -639,6 +654,9 @@ fn fetch_pnl_summary(
     base_asset: &str,
     quote_asset: &str,
 ) -> Result<Option<PnLSummary>> {
+    use crate::trade_history::TradeHistory;
+    use crate::trade_analysis::TradingStats;
+
     let history = SnapshotHistory::new(exchange, symbol);
     let snapshots = history.load_all()?;
 
@@ -686,6 +704,43 @@ fn fetch_pnl_summary(
             0.0
         };
 
+        // Load trade history and calculate statistics
+        let trade_stats = {
+            let trade_history = TradeHistory::new(exchange, symbol);
+            match trade_history.load_all() {
+                Ok(trades) if !trades.is_empty() => {
+                    // Filter trades within the snapshot period
+                    let start_ts = earlier.timestamp * 1000; // Convert to milliseconds
+                    let end_ts = later.timestamp * 1000;
+                    let period_trades: Vec<_> = trades
+                        .into_iter()
+                        .filter(|t| t.time >= start_ts && t.time <= end_ts)
+                        .collect();
+
+                    if !period_trades.is_empty() {
+                        match TradingStats::from_trades(&period_trades, symbol, base_asset, quote_asset) {
+                            Ok(stats) => Some(TradeStatsSummary {
+                                avg_buy_price: stats.avg_buy_price,
+                                avg_sell_price: stats.avg_sell_price,
+                                total_buy_quantity: stats.total_buy_quantity,
+                                total_sell_quantity: stats.total_sell_quantity,
+                                total_buy_cost: stats.total_buy_cost,
+                                total_sell_revenue: stats.total_sell_revenue,
+                                buy_count: stats.buy_count,
+                                sell_count: stats.sell_count,
+                                net_quantity: stats.net_quantity,
+                                realized_pnl: stats.realized_pnl,
+                            }),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+
         let summary = PnLSummary {
             period_start: report.earlier_snapshot.datetime.clone(),
             period_end: report.later_snapshot.datetime.clone(),
@@ -704,6 +759,7 @@ fn fetch_pnl_summary(
                 absolute_change: base_change,
                 percentage_change: base_pct,
             },
+            trade_stats,
         };
         Ok(Some(summary))
     } else {

@@ -6,6 +6,7 @@ Cargo.lock
 # Config files with sensitive data
 config.json
 *.json
+*.jsonl
 !example_config.json
 !frontend/package.json
 !frontend/package-lock.json

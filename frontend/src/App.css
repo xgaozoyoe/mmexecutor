@@ -413,6 +413,61 @@ strong {
   font-weight: 600;
 }
 
+/* Trade Statistics Sections */
+.trade-direction-section {
+  margin-bottom: 20px;
+  padding: 15px;
+  background: #f8f9fa;
+  border-radius: 8px;
+  border-left: 4px solid #4CAF50;
+}
+
+.trade-direction-section h5 {
+  margin: 0 0 12px 0;
+  font-size: 1.1em;
+  color: #333;
+}
+
+.trade-direction-section > div {
+  padding: 5px 0;
+  color: #555;
+}
+
+.highlight-price {
+  color: #2196F3;
+  font-size: 1.1em;
+}
+
+.market-price-section {
+  margin: 15px 0;
+  padding: 12px;
+  background: #e3f2fd;
+  border-radius: 8px;
+  font-weight: 600;
+  color: #1976d2;
+}
+
+.spread-section {
+  margin-top: 15px;
+  padding: 15px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border-radius: 8px;
+  color: white;
+}
+
+.spread-section > div {
+  padding: 5px 0;
+}
+
+.net-position-section {
+  margin-top: 15px;
+  padding: 12px;
+  background: #fff3cd;
+  border-radius: 8px;
+  color: #856404;
+  font-weight: 600;
+}
+
 @media (max-width: 768px) {
   .App {
     padding: 10px;

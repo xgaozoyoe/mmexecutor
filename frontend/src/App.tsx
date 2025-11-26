@@ -77,6 +77,7 @@ interface PnLSummary {
   duration_seconds: number;
   quote_asset_summary: AssetSummary;
   base_asset_summary: AssetSummary;
+  trade_stats: TradeStatsSummary | null;
 }
 
 interface AssetSummary {
@@ -85,6 +86,19 @@ interface AssetSummary {
   ending_value: number;
   absolute_change: number;
   percentage_change: number;
+}
+
+interface TradeStatsSummary {
+  avg_buy_price: number;
+  avg_sell_price: number;
+  total_buy_quantity: number;
+  total_sell_quantity: number;
+  total_buy_cost: number;
+  total_sell_revenue: number;
+  buy_count: number;
+  sell_count: number;
+  net_quantity: number;
+  realized_pnl: number;
 }
 
 interface ExchangeReport {
@@ -366,56 +380,90 @@ function App() {
                   </div>
                 </div>
 
-                {/* Average Trading Price */}
-                {(() => {
-                  const quoteChange = exchange.pnl_summary.quote_asset_summary.absolute_change;
-                  const baseChange = exchange.pnl_summary.base_asset_summary.absolute_change;
-                  // Calculate average price: USDT change / Base asset change
-                  // If base asset decreased (sold), price is positive quote change / negative base change
-                  // If base asset increased (bought), price is negative quote change / positive base change
-                  const avgPrice = baseChange !== 0 ? Math.abs(quoteChange / baseChange) : 0;
-                  const tradeDirection = baseChange < 0 ? 'Selling' : baseChange > 0 ? 'Buying' : 'No Trade';
-                  const currentPrice = exchange.market_depth.current_price;
-                  const priceDiff = avgPrice - currentPrice;
-                  const priceDiffPercent = currentPrice > 0 ? (priceDiff / currentPrice) * 100 : 0;
-
-                  return avgPrice > 0 ? (
-                    <div className="pnl-asset-card pnl-avg-price">
-                      <h4>📊 Average Trading Price Analysis</h4>
-                      <div className="pnl-details">
-                        <div>Direction: <strong>{tradeDirection} {exchange.pnl_summary.base_asset_summary.asset}</strong></div>
-                        <div>Average Price: <strong>{avgPrice.toFixed(6)} {exchange.pnl_summary.quote_asset_summary.asset}</strong></div>
-                        <div className="price-calculation">
-                          <small>
-                            Calculation: {Math.abs(quoteChange).toFixed(2)} {exchange.pnl_summary.quote_asset_summary.asset} ÷ {Math.abs(baseChange).toFixed(8)} {exchange.pnl_summary.base_asset_summary.asset}
-                          </small>
+                {/* Average Trading Price - From Trade History */}
+                {exchange.pnl_summary.trade_stats && (
+                  <div className="pnl-asset-card pnl-avg-price">
+                    <h4>📊 Trading Statistics (from actual trades)</h4>
+                    <div className="pnl-details">
+                      {/* Buy Statistics */}
+                      {exchange.pnl_summary.trade_stats.buy_count > 0 && (
+                        <div className="trade-direction-section">
+                          <h5>🟢 Buy Trades</h5>
+                          <div>Orders: <strong>{exchange.pnl_summary.trade_stats.buy_count}</strong></div>
+                          <div>Total Bought: <strong>{exchange.pnl_summary.trade_stats.total_buy_quantity.toFixed(8)} {exchange.pnl_summary.base_asset_summary.asset}</strong></div>
+                          <div>Total Cost: <strong>{exchange.pnl_summary.trade_stats.total_buy_cost.toFixed(2)} {exchange.pnl_summary.quote_asset_summary.asset}</strong></div>
+                          <div>Avg Buy Price: <strong className="highlight-price">{exchange.pnl_summary.trade_stats.avg_buy_price.toFixed(6)} {exchange.pnl_summary.quote_asset_summary.asset}</strong></div>
+                          {(() => {
+                            const currentPrice = exchange.market_depth.current_price;
+                            const buyPriceDiff = exchange.pnl_summary.trade_stats.avg_buy_price - currentPrice;
+                            const buyPriceDiffPercent = currentPrice > 0 ? (buyPriceDiff / currentPrice) * 100 : 0;
+                            return (
+                              <div className={buyPriceDiff < 0 ? 'price-diff-positive' : 'price-diff-negative'}>
+                                vs Market: <strong>{buyPriceDiff >= 0 ? '+' : ''}{buyPriceDiff.toFixed(6)} ({buyPriceDiff >= 0 ? '+' : ''}{buyPriceDiffPercent.toFixed(2)}%)</strong>
+                                <div className="performance-indicator">
+                                  {buyPriceDiff < 0 ? '✅ Bought below current market price' : '⚠️ Bought above current market price'}
+                                </div>
+                              </div>
+                            );
+                          })()}
                         </div>
-                        <div className="price-comparison">
-                          <div>Current Market Price: <strong>{currentPrice.toFixed(6)}</strong></div>
-                          <div className={priceDiff >= 0 ? 'price-diff-negative' : 'price-diff-positive'}>
-                            {baseChange < 0 ? (
-                              // If selling, we want average price > current price (sold high)
-                              <>
-                                Price Difference: <strong>{priceDiff >= 0 ? '+' : ''}{priceDiff.toFixed(6)} ({priceDiff >= 0 ? '+' : ''}{priceDiffPercent.toFixed(2)}%)</strong>
+                      )}
+
+                      {/* Sell Statistics */}
+                      {exchange.pnl_summary.trade_stats.sell_count > 0 && (
+                        <div className="trade-direction-section">
+                          <h5>🔴 Sell Trades</h5>
+                          <div>Orders: <strong>{exchange.pnl_summary.trade_stats.sell_count}</strong></div>
+                          <div>Total Sold: <strong>{exchange.pnl_summary.trade_stats.total_sell_quantity.toFixed(8)} {exchange.pnl_summary.base_asset_summary.asset}</strong></div>
+                          <div>Total Revenue: <strong>{exchange.pnl_summary.trade_stats.total_sell_revenue.toFixed(2)} {exchange.pnl_summary.quote_asset_summary.asset}</strong></div>
+                          <div>Avg Sell Price: <strong className="highlight-price">{exchange.pnl_summary.trade_stats.avg_sell_price.toFixed(6)} {exchange.pnl_summary.quote_asset_summary.asset}</strong></div>
+                          {(() => {
+                            const currentPrice = exchange.market_depth.current_price;
+                            const sellPriceDiff = exchange.pnl_summary.trade_stats.avg_sell_price - currentPrice;
+                            const sellPriceDiffPercent = currentPrice > 0 ? (sellPriceDiff / currentPrice) * 100 : 0;
+                            return (
+                              <div className={sellPriceDiff > 0 ? 'price-diff-positive' : 'price-diff-negative'}>
+                                vs Market: <strong>{sellPriceDiff >= 0 ? '+' : ''}{sellPriceDiff.toFixed(6)} ({sellPriceDiff >= 0 ? '+' : ''}{sellPriceDiffPercent.toFixed(2)}%)</strong>
                                 <div className="performance-indicator">
-                                  {priceDiff > 0 ? '✅ Sold above current market price' : '⚠️ Sold below current market price'}
+                                  {sellPriceDiff > 0 ? '✅ Sold above current market price' : '⚠️ Sold below current market price'}
                                 </div>
-                              </>
-                            ) : (
-                              // If buying, we want average price < current price (bought low)
-                              <>
-                                Price Difference: <strong>{priceDiff >= 0 ? '+' : ''}{priceDiff.toFixed(6)} ({priceDiff >= 0 ? '+' : ''}{priceDiffPercent.toFixed(2)}%)</strong>
-                                <div className="performance-indicator">
-                                  {priceDiff < 0 ? '✅ Bought below current market price' : '⚠️ Bought above current market price'}
-                                </div>
-                              </>
-                            )}
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      )}
+
+                      {/* Current Market Price */}
+                      <div className="market-price-section">
+                        <div>Current Market Price: <strong>{exchange.market_depth.current_price.toFixed(6)}</strong></div>
+                      </div>
+
+                      {/* Spread and PnL */}
+                      {exchange.pnl_summary.trade_stats.buy_count > 0 && exchange.pnl_summary.trade_stats.sell_count > 0 && (
+                        <div className="spread-section">
+                          <div>Avg Spread: <strong>
+                            {(exchange.pnl_summary.trade_stats.avg_sell_price - exchange.pnl_summary.trade_stats.avg_buy_price).toFixed(6)}
+                            ({((exchange.pnl_summary.trade_stats.avg_sell_price - exchange.pnl_summary.trade_stats.avg_buy_price) / exchange.pnl_summary.trade_stats.avg_buy_price * 100).toFixed(2)}%)
+                          </strong></div>
+                          <div className={exchange.pnl_summary.trade_stats.realized_pnl >= 0 ? 'positive' : 'negative'}>
+                            Realized PnL: <strong>
+                              {exchange.pnl_summary.trade_stats.realized_pnl >= 0 ? '+' : ''}
+                              {exchange.pnl_summary.trade_stats.realized_pnl.toFixed(2)} {exchange.pnl_summary.quote_asset_summary.asset}
+                            </strong>
                           </div>
                         </div>
+                      )}
+
+                      {/* Net Position */}
+                      <div className="net-position-section">
+                        <div>Net Position: <strong>
+                          {exchange.pnl_summary.trade_stats.net_quantity >= 0 ? '+' : ''}
+                          {exchange.pnl_summary.trade_stats.net_quantity.toFixed(8)} {exchange.pnl_summary.base_asset_summary.asset}
+                        </strong></div>
                       </div>
                     </div>
-                  ) : null;
-                })()}
+                  </div>
+                )}
               </div>
             </section>
           )}
