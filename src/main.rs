@@ -654,6 +654,99 @@ async fn place_unified_orders_for_exchange(
         std::io::stdin().read_line(&mut String::new())?;
     }
 
+    // Check account balance before placing orders
+    println!("\n💰 Checking account balance...");
+    let account = client.get_account_info().await?;
+    let (base_asset, quote_asset) = client.get_symbol_assets(&grid_config.symbol);
+
+    let mut usdt_available = 0.0;
+    let mut base_available = 0.0;
+    let mut usdt_locked = 0.0;
+    let mut base_locked = 0.0;
+
+    for balance in &account.balances {
+        if balance.asset == quote_asset {
+            usdt_available = balance.free.parse().unwrap_or(0.0);
+            usdt_locked = balance.locked.parse().unwrap_or(0.0);
+        } else if balance.asset == base_asset {
+            base_available = balance.free.parse().unwrap_or(0.0);
+            base_locked = balance.locked.parse().unwrap_or(0.0);
+        }
+    }
+
+    println!("  Available {} balance: {:.2} (locked: {:.2})", quote_asset, usdt_available, usdt_locked);
+    println!("  Available {} balance: {:.8} (locked: {:.8})", base_asset, base_available, base_locked);
+
+    // Calculate required resources
+    let total_buy_value: f64 = unified_orders.iter()
+        .filter(|o| o.side == "BUY")
+        .map(|o| o.price * o.quantity)
+        .sum();
+    let total_sell_quantity: f64 = unified_orders.iter()
+        .filter(|o| o.side == "SELL")
+        .map(|o| o.quantity)
+        .sum();
+
+    println!("  Required for planned orders:");
+    println!("    Buy orders need: {:.2} {}", total_buy_value, quote_asset);
+    println!("    Sell orders need: {:.8} {}", total_sell_quantity, base_asset);
+
+    // Sort orders: buy orders by price (high to low), sell orders by price (low to high)
+    let mut sorted_orders: Vec<_> = unified_orders.iter().cloned().collect();
+    sorted_orders.sort_by(|a, b| {
+        if a.side == "BUY" && b.side == "BUY" {
+            b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal)
+        } else if a.side == "SELL" && b.side == "SELL" {
+            a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal)
+        } else if a.side == "BUY" {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+
+    // Filter orders based on available balance
+    let mut filtered_orders = Vec::new();
+    let mut skipped_buy_count = 0;
+    let mut skipped_sell_count = 0;
+    let mut required_usdt = 0.0;
+    let mut required_base = 0.0;
+
+    for order in sorted_orders {
+        if order.side == "BUY" {
+            let order_value = order.price * order.quantity;
+            if required_usdt + order_value <= usdt_available {
+                required_usdt += order_value;
+                filtered_orders.push(order);
+            } else {
+                skipped_buy_count += 1;
+                println!("  ⚠️  Skipping BUY order @ {:.6} (value: {:.2} USDT) - insufficient balance",
+                         order.price, order_value);
+            }
+        } else if order.side == "SELL" {
+            if required_base + order.quantity <= base_available {
+                required_base += order.quantity;
+                filtered_orders.push(order);
+            } else {
+                skipped_sell_count += 1;
+                println!("  ⚠️  Skipping SELL order @ {:.6} (qty: {:.8} {}) - insufficient balance",
+                         order.price, order.quantity, base_asset);
+            }
+        }
+    }
+
+    if skipped_buy_count > 0 || skipped_sell_count > 0 {
+        println!("\n⚠️  Skipped {} BUY and {} SELL orders due to insufficient balance",
+                 skipped_buy_count, skipped_sell_count);
+    }
+
+    if filtered_orders.is_empty() {
+        println!("\n❌ All orders skipped due to insufficient balance. No orders to place.");
+        return Ok(());
+    }
+
+    let unified_orders = filtered_orders;
+
     // Place unified orders using batch API
     println!("\n📝 Placing {} unified orders using batch API...", unified_orders.len());
 
@@ -1049,6 +1142,107 @@ async fn place_orders_for_exchange(
     let mut failed = 0;
     let total_orders = orders.len();
 
+    // 获取账户余额以检查是否有足够的资金
+    println!("\n💰 Checking account balance...");
+    let account = client.get_account_info().await?;
+    let (base_asset, quote_asset) = client.get_symbol_assets(&grid_config.symbol);
+
+    // 查找 USDT 和基础资产余额
+    let mut usdt_available = 0.0;
+    let mut base_available = 0.0;
+    let mut usdt_locked = 0.0;
+    let mut base_locked = 0.0;
+
+    for balance in &account.balances {
+        if balance.asset == quote_asset {
+            usdt_available = balance.free.parse().unwrap_or(0.0);
+            usdt_locked = balance.locked.parse().unwrap_or(0.0);
+        } else if balance.asset == base_asset {
+            base_available = balance.free.parse().unwrap_or(0.0);
+            base_locked = balance.locked.parse().unwrap_or(0.0);
+        }
+    }
+
+    println!("  Available {} balance: {:.2} (locked: {:.2})", quote_asset, usdt_available, usdt_locked);
+    println!("  Available {} balance: {:.8} (locked: {:.8})", base_asset, base_available, base_locked);
+
+    // 计算计划下单需要的资源
+    let total_buy_value: f64 = orders.iter()
+        .filter(|o| o.side == "BUY")
+        .map(|o| o.price * o.quantity)
+        .sum();
+    let total_sell_quantity: f64 = orders.iter()
+        .filter(|o| o.side == "SELL")
+        .map(|o| o.quantity)
+        .sum();
+
+    println!("  Required for planned orders:");
+    println!("    Buy orders need: {:.2} {}", total_buy_value, quote_asset);
+    println!("    Sell orders need: {:.8} {}", total_sell_quantity, base_asset);
+
+    // 对订单进行排序，确保最接近市场价格的订单优先处理
+    // 买单：价格从高到低（最接近市场价的先）
+    // 卖单：价格从低到高（最接近市场价的先）
+    let mut sorted_orders = orders.clone();
+    sorted_orders.sort_by(|a, b| {
+        if a.side == "BUY" && b.side == "BUY" {
+            // 买单：价格高的优先
+            b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal)
+        } else if a.side == "SELL" && b.side == "SELL" {
+            // 卖单：价格低的优先
+            a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal)
+        } else if a.side == "BUY" {
+            // 买单在卖单前
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+
+    // 过滤掉余额不足的订单
+    let mut filtered_orders = Vec::new();
+    let mut skipped_buy_count = 0;
+    let mut skipped_sell_count = 0;
+    let mut required_usdt = 0.0;
+    let mut required_base = 0.0;
+
+    for order in sorted_orders {
+        if order.side == "BUY" {
+            let order_value = order.price * order.quantity;
+            if required_usdt + order_value <= usdt_available {
+                required_usdt += order_value;
+                filtered_orders.push(order);
+            } else {
+                skipped_buy_count += 1;
+                println!("  ⚠️  Skipping BUY order @ {:.6} (value: {:.2} USDT) - insufficient balance",
+                         order.price, order_value);
+            }
+        } else if order.side == "SELL" {
+            if required_base + order.quantity <= base_available {
+                required_base += order.quantity;
+                filtered_orders.push(order);
+            } else {
+                skipped_sell_count += 1;
+                println!("  ⚠️  Skipping SELL order @ {:.6} (qty: {:.8} {}) - insufficient balance",
+                         order.price, order.quantity, base_asset);
+            }
+        }
+    }
+
+    if skipped_buy_count > 0 || skipped_sell_count > 0 {
+        println!("\n⚠️  Skipped {} BUY and {} SELL orders due to insufficient balance",
+                 skipped_buy_count, skipped_sell_count);
+    }
+
+    if filtered_orders.is_empty() {
+        println!("\n❌ All orders skipped due to insufficient balance. No orders to place.");
+        println!("💡 Please deposit more funds or reduce order sizes in config.");
+        return Ok(());
+    }
+
+    let orders = filtered_orders;
+    let total_orders = orders.len();
+
     // Convert to BatchOrder format
     let batch_orders: Vec<exchange::BatchOrder> = orders
         .iter()
@@ -1060,7 +1254,7 @@ async fn place_orders_for_exchange(
         })
         .collect();
 
-    println!("📦 Using batch order API to place {} orders...", total_orders);
+    println!("\n📦 Using batch order API to place {} orders...", total_orders);
 
     // Use batch API
     match client.place_batch_limit_orders(batch_orders).await {
