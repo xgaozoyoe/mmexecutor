@@ -1,0 +1,54 @@
+{
+  "exchanges": [
+    {
+      "name": "mexc",
+      "api_key": "your_mexc_api_key",
+      "api_secret": "your_mexc_api_secret"
+    },
+    {
+      "name": "gate",
+      "api_key": "your_gate_api_key",
+      "api_secret": "your_gate_api_secret"
+    },
+    {
+      "name": "kucoin",
+      "api_key": "your_kucoin_api_key",
+      "api_secret": "your_kucoin_api_secret",
+      "api_passphrase": "your_kucoin_passphrase"
+    }
+  ],
+  "grid": {
+    "symbol": "ZKWASMUSDT",
+    "price_threshold": 0.01,
+    "config_above_threshold": {
+      "first_buy_offset_percentage": 0.5,
+      "first_sell_offset_percentage": 0.5,
+      "buy_price_percentage": 5.0,
+      "sell_price_percentage": 5.0,
+      "buy_grid_interval_percentage": 0.2,
+      "sell_grid_interval_percentage": 0.5,
+      "total_buy_value": 1500.0,
+      "total_sell_value": 1500.0,
+      "buy_grid_levels": 10,
+      "sell_grid_levels": 5,
+      "minimal_order_value": 100.0
+    },
+    "config_below_threshold": {
+      "first_buy_offset_percentage": 0.5,
+      "first_sell_offset_percentage": 0.5,
+      "buy_price_percentage": 5.0,
+      "sell_price_percentage": 5.0,
+      "buy_grid_interval_percentage": 0.5,
+      "sell_grid_interval_percentage": 0.2,
+      "total_buy_value": 1500.0,
+      "total_sell_value": 1500.0,
+      "buy_grid_levels": 5,
+      "sell_grid_levels": 10,
+      "minimal_order_value": 100.0
+    }
+  },
+  "mid_price_method_bid": "volume_threshold",
+  "mid_price_method_ask": "simple",
+  "orderbook_depth": 20,
+  "volume_threshold_usdt": 100.0
+}

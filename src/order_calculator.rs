@@ -26,17 +26,17 @@ impl OrderCalculator {
         let mut orders = Vec::new();
         let lowest_buy_price = current_price * (1.0 - config.buy_price_percentage / 100.0);
 
-        for i in 0..config.grid_levels {
+        for i in 0..config.buy_grid_levels {
             // 第一个订单使用 first_buy_offset_percentage
-            // 后续订单在第一个订单的基础上继续按 grid_interval_percentage 递减
-            let price_offset_percentage = config.first_buy_offset_percentage + config.grid_interval_percentage * i as f64;
+            // 后续订单在第一个订单的基础上继续按 buy_grid_interval_percentage 递减
+            let price_offset_percentage = config.first_buy_offset_percentage + config.buy_grid_interval_percentage * i as f64;
             let price = current_price * (1.0 - price_offset_percentage / 100.0);
 
             if price < lowest_buy_price {
                 break;
             }
 
-            let weight = Self::calculate_weight(i, config.grid_levels);
+            let weight = Self::calculate_weight(i, config.buy_grid_levels);
             let value = config.total_buy_value * weight;
             let quantity = value / price;
 
@@ -54,17 +54,17 @@ impl OrderCalculator {
         let mut orders = Vec::new();
         let highest_sell_price = current_price * (1.0 + config.sell_price_percentage / 100.0);
 
-        for i in 0..config.grid_levels {
+        for i in 0..config.sell_grid_levels {
             // 第一个订单使用 first_sell_offset_percentage
-            // 后续订单在第一个订单的基础上继续按 grid_interval_percentage 递增
-            let price_offset_percentage = config.first_sell_offset_percentage + config.grid_interval_percentage * i as f64;
+            // 后续订单在第一个订单的基础上继续按 sell_grid_interval_percentage 递增
+            let price_offset_percentage = config.first_sell_offset_percentage + config.sell_grid_interval_percentage * i as f64;
             let price = current_price * (1.0 + price_offset_percentage / 100.0);
 
             if price > highest_sell_price {
                 break;
             }
 
-            let weight = Self::calculate_weight(i, config.grid_levels);
+            let weight = Self::calculate_weight(i, config.sell_grid_levels);
             let quantity = (config.total_sell_value * weight) / price;
 
             orders.push(GridOrder {
@@ -106,15 +106,16 @@ mod tests {
     #[test]
     fn test_calculate_grid_orders() {
         let config = GridConfig {
-            symbol: "BTCUSDT".to_string(),
             first_buy_offset_percentage: 0.5,
             first_sell_offset_percentage: 0.5,
             buy_price_percentage: 5.0,
             sell_price_percentage: 5.0,
-            grid_interval_percentage: 0.5,
+            buy_grid_interval_percentage: 0.5,
+            sell_grid_interval_percentage: 0.5,
             total_buy_value: 100.0,
             total_sell_value: 100.0,
-            grid_levels: 10,
+            buy_grid_levels: 10,
+            sell_grid_levels: 10,
             minimal_order_value: 10.0,
         };
 

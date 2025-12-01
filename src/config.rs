@@ -18,27 +18,23 @@ impl Default for MidPriceMethod {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GridConfig {
-    pub symbol: String,
     pub first_buy_offset_percentage: f64,   // 第一个买单距离当前价格的百分比
     pub first_sell_offset_percentage: f64,  // 第一个卖单距离当前价格的百分比
     pub buy_price_percentage: f64,
     pub sell_price_percentage: f64,
-    pub grid_interval_percentage: f64,
+
+    pub buy_grid_interval_percentage: f64,  // 买单网格间隔
+    pub sell_grid_interval_percentage: f64, // 卖单网格间隔
+
     pub total_buy_value: f64,
     pub total_sell_value: f64,
-    pub grid_levels: usize,
-    pub minimal_order_value: f64,           // 最小订单总价值，低于此值不布单
 
-    // 中间价计算相关配置
-    #[serde(default)]
-    pub mid_price_method_bid: MidPriceMethod,   // Bid 价格计算方法
-    #[serde(default)]
-    pub mid_price_method_ask: MidPriceMethod,   // Ask 价格计算方法
-    #[serde(default = "default_orderbook_depth")]
-    pub orderbook_depth: u32,                   // 获取的订单簿深度
-    #[serde(default = "default_volume_threshold")]
-    pub volume_threshold_usdt: f64,             // VolumeThreshold 方法的默认阈值（USDT）
+    pub buy_grid_levels: usize,  // 买单层数
+    pub sell_grid_levels: usize, // 卖单层数
+
+    pub minimal_order_value: f64,           // 最小订单总价值，低于此值不布单
 }
+
 
 fn default_orderbook_depth() -> u32 {
     20
@@ -58,9 +54,72 @@ pub struct ExchangeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GridConfigWrapper {
+    // 条件配置：根据价格选择不同的配置
+    Conditional {
+        symbol: String,
+        price_threshold: f64,
+        config_above_threshold: GridConfig,  // 价格 >= threshold 时使用
+        config_below_threshold: GridConfig,  // 价格 < threshold 时使用
+    },
+    // 简单配置：直接使用单一配置
+    Simple {
+        symbol: String,
+        config: GridConfig,
+    },
+}
+
+impl GridConfigWrapper {
+    // 根据当前价格选择合适的配置
+    pub fn select_config(&self, current_price: f64) -> GridConfig {
+        match self {
+            GridConfigWrapper::Conditional {
+                price_threshold,
+                config_above_threshold,
+                config_below_threshold,
+                ..
+            } => {
+                if current_price >= *price_threshold {
+                    println!("📊 Price {:.6} >= threshold {:.6}, using config_above_threshold",
+                             current_price, price_threshold);
+                    config_above_threshold.clone()
+                } else {
+                    println!("📊 Price {:.6} < threshold {:.6}, using config_below_threshold",
+                             current_price, price_threshold);
+                    config_below_threshold.clone()
+                }
+            }
+            GridConfigWrapper::Simple { config, .. } => {
+                println!("📊 Using simple config (no conditional)");
+                config.clone()
+            }
+        }
+    }
+
+    // 获取交易对符号
+    pub fn get_symbol(&self) -> &str {
+        match self {
+            GridConfigWrapper::Conditional { symbol, .. } => symbol,
+            GridConfigWrapper::Simple { symbol, .. } => symbol,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub exchanges: Vec<ExchangeConfig>,
-    pub grid: GridConfig,
+    pub grid: GridConfigWrapper,
+
+    // 中间价计算相关配置（条件之外）
+    #[serde(default)]
+    pub mid_price_method_bid: MidPriceMethod,   // Bid 价格计算方法
+    #[serde(default)]
+    pub mid_price_method_ask: MidPriceMethod,   // Ask 价格计算方法
+    #[serde(default = "default_orderbook_depth")]
+    pub orderbook_depth: u32,                   // 获取的订单簿深度
+    #[serde(default = "default_volume_threshold")]
+    pub volume_threshold_usdt: f64,             // VolumeThreshold 方法的默认阈值（USDT）
 }
 
 impl Config {
@@ -90,40 +149,66 @@ impl Config {
                 anyhow::bail!("Exchange #{} ({}) API secret cannot be empty", i + 1, exchange.name);
             }
         }
-        if config.grid.symbol.is_empty() {
+        // 验证 symbol
+        if config.grid.get_symbol().is_empty() {
             anyhow::bail!("Symbol cannot be empty");
         }
-        if config.grid.first_buy_offset_percentage <= 0.0 {
-            anyhow::bail!("First buy offset percentage must be positive");
-        }
-        if config.grid.first_sell_offset_percentage <= 0.0 {
-            anyhow::bail!("First sell offset percentage must be positive");
-        }
-        if config.grid.buy_price_percentage <= 0.0 || config.grid.buy_price_percentage >= 100.0 {
-            anyhow::bail!("Buy price percentage must be between 0 and 100");
-        }
-        if config.grid.sell_price_percentage <= 0.0 || config.grid.sell_price_percentage >= 100.0 {
-            anyhow::bail!("Sell price percentage must be between 0 and 100");
-        }
-        if config.grid.grid_interval_percentage <= 0.0 {
-            anyhow::bail!("Grid interval percentage must be positive");
-        }
-        if config.grid.total_buy_value <= 0.0 {
-            anyhow::bail!("Total buy value must be positive");
-        }
-        if config.grid.total_sell_value <= 0.0 {
-            anyhow::bail!("Total sell value must be positive");
-        }
-        if config.grid.grid_levels == 0 {
-            anyhow::bail!("Grid levels must be at least 1");
-        }
-        if config.grid.minimal_order_value <= 0.0 {
-            anyhow::bail!("Minimal order value must be positive");
+
+        // 验证网格配置
+        let configs_to_validate: Vec<&GridConfig> = match &config.grid {
+            GridConfigWrapper::Conditional { config_above_threshold, config_below_threshold, price_threshold, .. } => {
+                if *price_threshold <= 0.0 {
+                    anyhow::bail!("Price threshold must be positive");
+                }
+                vec![config_above_threshold, config_below_threshold]
+            }
+            GridConfigWrapper::Simple { config, .. } => vec![config],
+        };
+
+        for grid_config in configs_to_validate {
+            if grid_config.first_buy_offset_percentage <= 0.0 {
+                anyhow::bail!("First buy offset percentage must be positive");
+            }
+            if grid_config.first_sell_offset_percentage <= 0.0 {
+                anyhow::bail!("First sell offset percentage must be positive");
+            }
+            if grid_config.buy_price_percentage <= 0.0 || grid_config.buy_price_percentage >= 100.0 {
+                anyhow::bail!("Buy price percentage must be between 0 and 100");
+            }
+            if grid_config.sell_price_percentage <= 0.0 || grid_config.sell_price_percentage >= 100.0 {
+                anyhow::bail!("Sell price percentage must be between 0 and 100");
+            }
+            if grid_config.buy_grid_interval_percentage <= 0.0 {
+                anyhow::bail!("Buy grid interval percentage must be positive");
+            }
+            if grid_config.sell_grid_interval_percentage <= 0.0 {
+                anyhow::bail!("Sell grid interval percentage must be positive");
+            }
+            if grid_config.total_buy_value <= 0.0 {
+                anyhow::bail!("Total buy value must be positive");
+            }
+            if grid_config.total_sell_value <= 0.0 {
+                anyhow::bail!("Total sell value must be positive");
+            }
+            if grid_config.buy_grid_levels == 0 {
+                anyhow::bail!("Buy grid levels must be at least 1");
+            }
+            if grid_config.sell_grid_levels == 0 {
+                anyhow::bail!("Sell grid levels must be at least 1");
+            }
+            if grid_config.minimal_order_value <= 0.0 {
+                anyhow::bail!("Minimal order value must be positive");
+            }
         }
         Ok(())
     }
 
     pub fn create_example(path: &str) -> Result<()> {
+        // 创建一个简单配置的示例
+        Self::create_simple_example(path)
+    }
+
+    pub fn create_simple_example(path: &str) -> Result<()> {
         let example = Config {
             exchanges: vec![
                 ExchangeConfig {
@@ -145,27 +230,86 @@ impl Config {
                     api_passphrase: Some("your_kucoin_passphrase".to_string()),
                 },
             ],
-            grid: GridConfig {
+            grid: GridConfigWrapper::Simple {
                 symbol: "BTCUSDT".to_string(),
-                first_buy_offset_percentage: 0.5,  // 第一个买单距离当前价格 0.5%
-                first_sell_offset_percentage: 0.5, // 第一个卖单距离当前价格 0.5%
-                buy_price_percentage: 5.0,
-                sell_price_percentage: 5.0,
-                grid_interval_percentage: 0.5,
-                total_buy_value: 500.0,  // 最小建议值，确保每个订单 >= 1 USDT
-                total_sell_value: 500.0,
-                grid_levels: 10,
-                minimal_order_value: 10.0,  // 调整后的总价值低于此值不布单
-
-                // 中间价计算方法
-                // Simple: 直接取最优价
-                // WeightedByVolume: 按订单量加权平均
-                // VolumeThreshold: 基于最近成交买单价值的深度阈值
-                mid_price_method_bid: MidPriceMethod::VolumeThreshold,  // Bid 使用深度阈值
-                mid_price_method_ask: MidPriceMethod::Simple,           // Ask 直接取最优卖价
-                orderbook_depth: 20,         // 获取20档订单簿
-                volume_threshold_usdt: 100.0, // 当没有成交历史时使用的默认阈值
+                config: GridConfig {
+                    first_buy_offset_percentage: 0.5,  // 第一个买单距离当前价格 0.5%
+                    first_sell_offset_percentage: 0.5, // 第一个卖单距离当前价格 0.5%
+                    buy_price_percentage: 5.0,
+                    sell_price_percentage: 5.0,
+                    buy_grid_interval_percentage: 0.5,   // 买单网格间隔 0.5%
+                    sell_grid_interval_percentage: 0.5,  // 卖单网格间隔 0.5%
+                    total_buy_value: 500.0,  // 最小建议值，确保每个订单 >= 1 USDT
+                    total_sell_value: 500.0,
+                    buy_grid_levels: 10,   // 买单层数
+                    sell_grid_levels: 10,  // 卖单层数
+                    minimal_order_value: 10.0,  // 调整后的总价值低于此值不布单
+                },
             },
+            // 中间价计算方法（条件之外的全局配置）
+            // Simple: 直接取最优价
+            // WeightedByVolume: 按订单量加权平均
+            // VolumeThreshold: 基于最近成交买单价值的深度阈值
+            mid_price_method_bid: MidPriceMethod::VolumeThreshold,  // Bid 使用深度阈值
+            mid_price_method_ask: MidPriceMethod::Simple,           // Ask 直接取最优卖价
+            orderbook_depth: 20,         // 获取20档订单簿
+            volume_threshold_usdt: 100.0, // 当没有成交历史时使用的默认阈值
+        };
+
+        let json = serde_json::to_string_pretty(&example)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    pub fn create_conditional_example(path: &str) -> Result<()> {
+        let base_config = GridConfig {
+            first_buy_offset_percentage: 0.5,
+            first_sell_offset_percentage: 0.5,
+            buy_price_percentage: 5.0,
+            sell_price_percentage: 5.0,
+            buy_grid_interval_percentage: 0.3,
+            sell_grid_interval_percentage: 0.3,
+            total_buy_value: 1500.0,
+            total_sell_value: 1500.0,
+            buy_grid_levels: 7,
+            sell_grid_levels: 7,
+            minimal_order_value: 100.0,
+        };
+
+        let example = Config {
+            exchanges: vec![
+                ExchangeConfig {
+                    name: "mexc".to_string(),
+                    api_key: "your_mexc_api_key".to_string(),
+                    api_secret: "your_mexc_api_secret".to_string(),
+                    api_passphrase: None,
+                },
+            ],
+            grid: GridConfigWrapper::Conditional {
+                symbol: "ZKWASMUSDT".to_string(),
+                price_threshold: 0.01,  // 价格阈值：0.01 USDT
+                config_above_threshold: GridConfig {
+                    // 高价时：密集买单，稀疏卖单
+                    buy_grid_levels: 10,
+                    sell_grid_levels: 5,
+                    buy_grid_interval_percentage: 0.2,  // 买单间隔更小
+                    sell_grid_interval_percentage: 0.5,  // 卖单间隔更大
+                    ..base_config.clone()
+                },
+                config_below_threshold: GridConfig {
+                    // 低价时：稀疏买单，密集卖单
+                    buy_grid_levels: 5,
+                    sell_grid_levels: 10,
+                    buy_grid_interval_percentage: 0.5,  // 买单间隔更大
+                    sell_grid_interval_percentage: 0.2,  // 卖单间隔更小
+                    ..base_config
+                },
+            },
+            // 中间价计算方法（条件之外的全局配置）
+            mid_price_method_bid: MidPriceMethod::VolumeThreshold,
+            mid_price_method_ask: MidPriceMethod::Simple,
+            orderbook_depth: 20,
+            volume_threshold_usdt: 100.0,
         };
 
         let json = serde_json::to_string_pretty(&example)?;

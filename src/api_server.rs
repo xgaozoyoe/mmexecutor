@@ -254,7 +254,7 @@ async fn fetch_and_snapshot_report_data(config_path: &str, iteration: Option<u64
     let mut exchanges = Vec::new();
 
     for exchange_config in &config.exchanges {
-        match fetch_exchange_report_with_snapshot(exchange_config, &config.grid, iteration).await {
+        match fetch_exchange_report_with_snapshot(exchange_config, config.grid.get_symbol(), iteration).await {
             Ok(report) => exchanges.push(report),
             Err(e) => {
                 eprintln!("Warning: Failed to fetch report for {}: {}", exchange_config.name, e);
@@ -270,14 +270,14 @@ async fn fetch_and_snapshot_report_data(config_path: &str, iteration: Option<u64
 
 async fn fetch_exchange_report(
     exchange_config: &crate::config::ExchangeConfig,
-    grid_config: &crate::config::GridConfig,
+    symbol: &str,
 ) -> Result<ExchangeReport> {
-    fetch_exchange_report_with_snapshot(exchange_config, grid_config, None).await
+    fetch_exchange_report_with_snapshot(exchange_config, symbol, None).await
 }
 
 async fn fetch_exchange_report_with_snapshot(
     exchange_config: &crate::config::ExchangeConfig,
-    grid_config: &crate::config::GridConfig,
+    symbol: &str,
     iteration: Option<u64>,
 ) -> Result<ExchangeReport> {
     let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_config.name))
@@ -290,29 +290,29 @@ async fn fetch_exchange_report_with_snapshot(
         exchange_config.api_passphrase.clone(),
     )?;
 
-    let (base_asset, quote_asset) = client.get_symbol_assets(&grid_config.symbol);
+    let (base_asset, quote_asset) = client.get_symbol_assets(symbol);
 
     // Fetch account info
-    let account_info = fetch_account_info(&client, &grid_config.symbol, &base_asset, &quote_asset).await?;
+    let account_info = fetch_account_info(&client, symbol, &base_asset, &quote_asset).await?;
 
     // Fetch market depth
-    let market_depth = fetch_market_depth(&client, &grid_config.symbol).await?;
+    let market_depth = fetch_market_depth(&client, symbol).await?;
 
     // Fetch order depth
-    let order_depth = fetch_order_depth(&client, &grid_config.symbol).await?;
+    let order_depth = fetch_order_depth(&client, symbol).await?;
 
     // Fetch snapshots info
-    let snapshots_info = fetch_snapshots_info(&exchange_config.name, &grid_config.symbol, &base_asset, &quote_asset)?;
+    let snapshots_info = fetch_snapshots_info(&exchange_config.name, symbol, &base_asset, &quote_asset)?;
 
     // Fetch PnL summary
-    let pnl_summary = fetch_pnl_summary(&exchange_config.name, &grid_config.symbol, &base_asset, &quote_asset)?;
+    let pnl_summary = fetch_pnl_summary(&exchange_config.name, symbol, &base_asset, &quote_asset)?;
 
     // Capture and save snapshot if iteration is provided
     if iteration.is_some() {
         match capture_and_save_snapshot(
             &client,
             &exchange_config.name,
-            &grid_config.symbol,
+            symbol,
             Some(market_depth.current_price),
             iteration,
         ).await {
@@ -812,8 +812,9 @@ async fn sync_trade_history(config_path: &str) -> Result<()> {
             exchange_config.api_passphrase.clone(),
         )?;
 
-        let trade_history = TradeHistory::new(exchange_name, &config.grid.symbol);
-        let snapshot_history = SnapshotHistory::new(exchange_name, &config.grid.symbol);
+        let symbol = config.grid.get_symbol();
+        let trade_history = TradeHistory::new(exchange_name, symbol);
+        let snapshot_history = SnapshotHistory::new(exchange_name, symbol);
 
         // 获取上一次同步的时间点
         let last_sync_time = match trade_history.get_last_trade_time()? {
@@ -846,7 +847,7 @@ async fn sync_trade_history(config_path: &str) -> Result<()> {
                 .unwrap_or_default()
                 .format("%Y-%m-%d %H:%M:%S UTC"));
 
-        match client.get_my_trades(&config.grid.symbol, Some(1000)).await {
+        match client.get_my_trades(symbol, Some(1000)).await {
             Ok(trades) => {
                 // 过滤出时间范围内的交易
                 let new_trades: Vec<_> = trades
