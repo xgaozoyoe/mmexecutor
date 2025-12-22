@@ -155,9 +155,6 @@ impl Exchange for MexcExchange {
             return Ok(Vec::new());
         }
 
-        // 所有订单必须是同一个交易对
-        let symbol = &orders[0].symbol;
-
         let timestamp = Self::get_timestamp();
 
         // 构建批量订单数据
@@ -313,6 +310,32 @@ impl Exchange for MexcExchange {
             .json()
             .await
             .context("Failed to parse trades")
+    }
+
+    async fn get_order(&self, symbol: &str, order_id: &str) -> Result<OpenOrder> {
+        let timestamp = Self::get_timestamp();
+        let query_string = format!("symbol={}&orderId={}&timestamp={}", symbol, order_id, timestamp);
+        let signature = self.generate_signature(&query_string);
+
+        let url = format!("{}/api/v3/order?{}&signature={}", BASE_URL, query_string, signature);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-MEXC-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("Failed to get order")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get order: {}", error_text);
+        }
+
+        response
+            .json()
+            .await
+            .context("Failed to parse order response")
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<serde_json::Value> {

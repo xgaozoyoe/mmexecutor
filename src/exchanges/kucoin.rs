@@ -459,6 +459,50 @@ impl Exchange for KucoinExchange {
         }
     }
 
+    async fn get_order(&self, symbol: &str, order_id: &str) -> Result<OpenOrder> {
+        let timestamp = Self::get_timestamp();
+        let endpoint = format!("/api/v1/orders/{}", order_id);
+        let signature = self.generate_signature(timestamp, "GET", &endpoint, "");
+        let passphrase_signature = self.generate_passphrase_signature();
+
+        let url = format!("{}{}", BASE_URL, endpoint);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KC-API-KEY", &self.api_key)
+            .header("KC-API-SIGN", signature)
+            .header("KC-API-TIMESTAMP", timestamp.to_string())
+            .header("KC-API-PASSPHRASE", passphrase_signature)
+            .header("KC-API-KEY-VERSION", "2")
+            .send()
+            .await
+            .context("Failed to get order")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get order: {}", error_text);
+        }
+
+        let kucoin_response: serde_json::Value = response.json().await?;
+
+        if let Some(v) = kucoin_response.get("data") {
+            Ok(OpenOrder {
+                symbol: v["symbol"].as_str().unwrap_or(symbol).replace("-", ""),
+                order_id: v["id"].as_str().unwrap_or(order_id).to_string(),
+                price: v["price"].as_str().unwrap_or("0").to_string(),
+                orig_qty: v["size"].as_str().unwrap_or("0").to_string(),
+                executed_qty: v["dealSize"].as_str().unwrap_or("0").to_string(),
+                status: if v["isActive"].as_bool().unwrap_or(false) { "NEW".to_string() } else { "FILLED".to_string() },
+                side: v["side"].as_str().unwrap_or("").to_uppercase(),
+                order_type: v["type"].as_str().unwrap_or("limit").to_uppercase(),
+                time: v["createdAt"].as_i64().unwrap_or(0),
+            })
+        } else {
+            anyhow::bail!("Failed to parse order response: no data field")
+        }
+    }
+
     async fn cancel_order(&self, _symbol: &str, order_id: &str) -> Result<serde_json::Value> {
         let timestamp = Self::get_timestamp();
         let endpoint = format!("/api/v1/orders/{}", order_id);

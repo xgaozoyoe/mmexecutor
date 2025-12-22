@@ -525,6 +525,73 @@ impl Exchange for GateExchange {
         Ok(trades)
     }
 
+    async fn get_order(&self, symbol: &str, order_id: &str) -> Result<OpenOrder> {
+        let timestamp = Self::get_timestamp();
+        let url_path = format!("/api/v4/spot/orders/{}", order_id);
+
+        let gate_symbol = symbol.replace("USDT", "_USDT")
+            .replace("USDC", "_USDC")
+            .replace("BTC", "_BTC")
+            .replace("ETH", "_ETH");
+
+        let query_string = format!("currency_pair={}", gate_symbol);
+
+        let body_hash = format!("{:x}", sha2::Sha512::digest(b""));
+        let signature = self.generate_signature("GET", &url_path, &query_string, &body_hash, timestamp);
+
+        let url = format!("{}{}?{}", BASE_URL, url_path, query_string);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("KEY", &self.api_key)
+            .header("Timestamp", timestamp.to_string())
+            .header("SIGN", signature)
+            .send()
+            .await
+            .context("Failed to get order")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            anyhow::bail!("Failed to get order: {}", error_text);
+        }
+
+        let v: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse order response")?;
+
+        let amount: f64 = v["amount"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+        let filled_amount: f64 = v["filled_amount"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+
+        let executed = if filled_amount > 0.0 {
+            filled_amount
+        } else {
+            let left: f64 = v["left"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+            amount - left
+        };
+
+        let status_str = v["status"].as_str().unwrap_or("open");
+        let status = match status_str {
+            "open" => "NEW".to_string(),
+            "closed" => "FILLED".to_string(),
+            "cancelled" => "CANCELED".to_string(),
+            other => other.to_uppercase(),
+        };
+
+        Ok(OpenOrder {
+            symbol: v["currency_pair"].as_str().unwrap_or(symbol).replace("_", ""),
+            order_id: v["id"].as_str().unwrap_or(order_id).to_string(),
+            price: v["price"].as_str().unwrap_or("0").to_string(),
+            orig_qty: v["amount"].as_str().unwrap_or("0").to_string(),
+            executed_qty: executed.to_string(),
+            status,
+            side: v["side"].as_str().unwrap_or("").to_uppercase(),
+            order_type: v["type"].as_str().unwrap_or("limit").to_uppercase(),
+            time: v["create_time"].as_i64().unwrap_or(0) * 1000,
+        })
+    }
+
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<serde_json::Value> {
         let timestamp = Self::get_timestamp();
         let url_path = format!("/api/v4/spot/orders/{}", order_id);

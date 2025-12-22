@@ -32,5 +32,18 @@
     "mid_price_method_ask": "simple",
     "orderbook_depth": 20,
     "volume_threshold_usdt": 100.0
+  },
+  "volume": {
+    "exchange": "mexc",
+    "account1": {
+      "api_key": "first_account_api_key",
+      "api_secret": "first_account_api_secret"
+    },
+    "account2": {
+      "api_key": "second_account_api_key",
+      "api_secret": "second_account_api_secret"
+    },
+    "default_value": 10,
+    "price_offset": 0.000001
   }
 }

@@ -135,6 +135,9 @@ pub trait Exchange: Send + Sync {
     /// 获取我的交易记录
     async fn get_my_trades(&self, symbol: &str, limit: Option<u32>) -> Result<Vec<Trade>>;
 
+    /// 查询单个订单状态
+    async fn get_order(&self, symbol: &str, order_id: &str) -> Result<OpenOrder>;
+
     /// 取消订单
     async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<serde_json::Value>;
 

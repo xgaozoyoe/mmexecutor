@@ -503,4 +503,55 @@ strong {
   .tab {
     min-width: 100%;
   }
+
+  .stats-24h-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 24 Hour Statistics */
+.stats-24h-section {
+  margin-top: 20px;
+  padding-top: 15px;
+  border-top: 1px solid #e0e0e0;
+}
+
+.stats-24h-section h5 {
+  margin: 0 0 15px 0;
+  color: #333;
+  font-size: 1.1em;
+}
+
+.stats-24h-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+}
+
+.stats-24h-buy,
+.stats-24h-sell {
+  padding: 12px;
+  border-radius: 8px;
+  font-size: 0.9em;
+}
+
+.stats-24h-buy {
+  background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%);
+  border-left: 3px solid #4caf50;
+}
+
+.stats-24h-sell {
+  background: linear-gradient(135deg, #ffebee 0%, #ffcdd2 100%);
+  border-left: 3px solid #f44336;
+}
+
+.stats-24h-header {
+  font-weight: bold;
+  margin-bottom: 8px;
+  font-size: 1em;
+}
+
+.stats-24h-buy div,
+.stats-24h-sell div {
+  margin-bottom: 4px;
 }

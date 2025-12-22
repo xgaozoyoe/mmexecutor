@@ -53,6 +53,53 @@ pub struct ExchangeConfig {
     pub api_passphrase: Option<String>,  // KuCoin 需要
 }
 
+/// 刷量账户配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeAccountConfig {
+    pub api_key: String,
+    pub api_secret: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_passphrase: Option<String>,  // KuCoin 需要
+}
+
+fn default_volume_value() -> f64 {
+    10.0
+}
+
+fn default_price_offset() -> f64 {
+    0.000001  // 默认价格偏移量
+}
+
+fn default_guard_price_offset() -> f64 {
+    0.000001  // 阻挡单价格偏移量（相对于maker单）
+}
+
+fn default_guard_quantity_percent() -> f64 {
+    1.0  // 阻挡单数量百分比（相对于maker单），默认1%
+}
+
+fn default_enable_guard_order() -> bool {
+    true  // 默认启用阻挡单
+}
+
+/// 刷量配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeConfig {
+    pub exchange: String,  // 交易所名称: "mexc", "gate", "kucoin"
+    pub account1: VolumeAccountConfig,  // 第一个账户 (maker)
+    pub account2: VolumeAccountConfig,  // 第二个账户 (taker)
+    #[serde(default = "default_volume_value")]
+    pub default_value: f64,  // 默认刷量金额（USDT），默认10
+    #[serde(default = "default_price_offset")]
+    pub price_offset: f64,  // 价格偏移量（绝对值），相对于最优价的偏移
+    #[serde(default = "default_enable_guard_order")]
+    pub enable_guard_order: bool,  // 是否启用阻挡单防套利
+    #[serde(default = "default_guard_price_offset")]
+    pub guard_price_offset: f64,  // 阻挡单相对于maker单的价格偏移
+    #[serde(default = "default_guard_quantity_percent")]
+    pub guard_quantity_percent: f64,  // 阻挡单数量百分比（相对于maker单的百分比）
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GridConfigWrapper {
@@ -120,6 +167,10 @@ pub struct Config {
     pub orderbook_depth: u32,                   // 获取的订单簿深度
     #[serde(default = "default_volume_threshold")]
     pub volume_threshold_usdt: f64,             // VolumeThreshold 方法的默认阈值（USDT）
+
+    // 刷量配置（可选）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<VolumeConfig>,
 }
 
 impl Config {
@@ -254,6 +305,7 @@ impl Config {
             mid_price_method_ask: MidPriceMethod::Simple,           // Ask 直接取最优卖价
             orderbook_depth: 20,         // 获取20档订单簿
             volume_threshold_usdt: 100.0, // 当没有成交历史时使用的默认阈值
+            volume: None,  // 刷量配置（可选，使用 create-volume 命令时需要配置）
         };
 
         let json = serde_json::to_string_pretty(&example)?;
@@ -310,6 +362,7 @@ impl Config {
             mid_price_method_ask: MidPriceMethod::Simple,
             orderbook_depth: 20,
             volume_threshold_usdt: 100.0,
+            volume: None,
         };
 
         let json = serde_json::to_string_pretty(&example)?;

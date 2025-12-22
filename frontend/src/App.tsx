@@ -99,6 +99,15 @@ interface TradeStatsSummary {
   sell_count: number;
   net_quantity: number;
   realized_pnl: number;
+  // 24小时统计
+  buy_24h_quantity: number;
+  buy_24h_cost: number;
+  buy_24h_avg_price: number;
+  buy_24h_count: number;
+  sell_24h_quantity: number;
+  sell_24h_revenue: number;
+  sell_24h_avg_price: number;
+  sell_24h_count: number;
 }
 
 interface ExchangeReport {
@@ -461,6 +470,33 @@ function App() {
                           {exchange.pnl_summary.trade_stats.net_quantity.toFixed(8)} {exchange.pnl_summary.base_asset_summary.asset}
                         </strong></div>
                       </div>
+
+                      {/* 24 Hour Statistics */}
+                      {(exchange.pnl_summary.trade_stats.buy_24h_count > 0 || exchange.pnl_summary.trade_stats.sell_24h_count > 0) && (
+                        <div className="stats-24h-section">
+                          <h5>🕐 Last 24 Hours</h5>
+                          <div className="stats-24h-grid">
+                            <div className="stats-24h-buy">
+                              <div className="stats-24h-header">🟢 Buy (24h)</div>
+                              <div>Orders: <strong>{exchange.pnl_summary.trade_stats.buy_24h_count}</strong></div>
+                              <div>Quantity: <strong>{exchange.pnl_summary.trade_stats.buy_24h_quantity.toFixed(8)}</strong></div>
+                              <div>Cost: <strong>{exchange.pnl_summary.trade_stats.buy_24h_cost.toFixed(2)}</strong></div>
+                              {exchange.pnl_summary.trade_stats.buy_24h_count > 0 && (
+                                <div>Avg Price: <strong>{exchange.pnl_summary.trade_stats.buy_24h_avg_price.toFixed(6)}</strong></div>
+                              )}
+                            </div>
+                            <div className="stats-24h-sell">
+                              <div className="stats-24h-header">🔴 Sell (24h)</div>
+                              <div>Orders: <strong>{exchange.pnl_summary.trade_stats.sell_24h_count}</strong></div>
+                              <div>Quantity: <strong>{exchange.pnl_summary.trade_stats.sell_24h_quantity.toFixed(8)}</strong></div>
+                              <div>Revenue: <strong>{exchange.pnl_summary.trade_stats.sell_24h_revenue.toFixed(2)}</strong></div>
+                              {exchange.pnl_summary.trade_stats.sell_24h_count > 0 && (
+                                <div>Avg Price: <strong>{exchange.pnl_summary.trade_stats.sell_24h_avg_price.toFixed(6)}</strong></div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}

@@ -13,7 +13,7 @@ use account_snapshot::{AccountSnapshot, AssetSnapshot, PnLAnalyzer, SnapshotHist
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
-use exchange::Exchange;
+use exchange::{BatchOrder, Exchange, OrderBook};
 use exchanges::{create_exchange, ExchangeType};
 use order_calculator::OrderCalculator;
 use price_calculator::PriceCalculator;
@@ -100,6 +100,27 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         limit: usize,
     },
+    /// 刷量：通过两个账户对敲制造成交量（需要在config中配置volume字段）
+    CreateVolume {
+        /// 配置文件路径
+        #[arg(default_value = "config.json")]
+        config: String,
+        /// 方向：buy（制造买入成交）或 sell（制造卖出成交）
+        #[arg(short, long)]
+        direction: String,
+        /// 成交金额（USDT），0表示使用config中volume.default_value的值
+        #[arg(short, long, default_value_t = 0.0)]
+        value: f64,
+        /// 重复次数，默认1次
+        #[arg(short, long, default_value_t = 1)]
+        repeat: u32,
+        /// 重复间隔（秒），默认120秒（2分钟）
+        #[arg(short, long, default_value_t = 120)]
+        interval: u64,
+        /// 切换方向次数，默认0（不切换）
+        #[arg(short, long, default_value_t = 0)]
+        toggle: u32,
+    },
 }
 
 #[tokio::main]
@@ -132,6 +153,9 @@ async fn main() -> Result<()> {
         }
         Commands::TradeStats { config, exchange, limit } => {
             show_trade_stats(&config, &exchange, limit).await?;
+        }
+        Commands::CreateVolume { config, direction, value, repeat, interval, toggle } => {
+            create_volume(&config, &direction, value, repeat, interval, toggle).await?;
         }
     }
 
@@ -490,7 +514,6 @@ async fn place_orders_internal_with_iteration(
         match place_unified_orders_for_exchange(
             exchange_config,
             config.grid.get_symbol(),
-            &selected_grid_config,
             &unified_orders,
             auto_mode,
             iteration
@@ -517,7 +540,7 @@ async fn get_exchange_mid_price(
     exchange_config: &config::ExchangeConfig,
     config: &config::Config,
 ) -> Result<f64> {
-    use crate::order_calculator::OrderCalculator;
+    
 
     let symbol = config.grid.get_symbol();
 
@@ -570,7 +593,6 @@ async fn get_exchange_mid_price(
 async fn place_unified_orders_for_exchange(
     exchange_config: &config::ExchangeConfig,
     symbol: &str,
-    grid_config: &config::GridConfig,
     unified_orders: &[order_calculator::GridOrder],
     auto_mode: bool,
     iteration: Option<u64>,
@@ -1152,7 +1174,6 @@ async fn place_orders_for_exchange(
 
     let mut successful = 0;
     let mut failed = 0;
-    let total_orders = orders.len();
 
     // 获取账户余额以检查是否有足够的资金
     println!("\n💰 Checking account balance...");
@@ -1953,6 +1974,1000 @@ async fn show_trade_stats(
                 .unwrap_or_default()
                 .format("%Y-%m-%d %H:%M:%S UTC"));
     }
+
+    Ok(())
+}
+
+/// 刷量：通过两个账户对敲制造成交量
+///
+/// direction = "buy": 制造买入成交
+///   - 账户1在ask最低价下方挂卖单（maker）
+///   - 账户2在相同价格挂买单成交（taker）
+///
+/// direction = "sell": 制造卖出成交
+///   - 账户1在bid最高价上方挂买单（maker）
+///   - 账户2在相同价格挂卖单成交（taker）
+async fn create_volume(
+    config_path: &str,
+    direction: &str,
+    value: f64,
+    repeat: u32,
+    interval: u64,
+    toggle: u32,
+) -> Result<()> {
+    println!("📊 刷量模式 (Create Volume)");
+    println!("{}", "═".repeat(60));
+
+    // 验证方向参数
+    let initial_direction = direction.to_lowercase();
+    if initial_direction != "buy" && initial_direction != "sell" {
+        anyhow::bail!("Invalid direction: {}. Must be 'buy' or 'sell'", initial_direction);
+    }
+
+    // 加载配置
+    let config = Config::from_file(config_path)?;
+    let symbol = config.grid.get_symbol().to_string();
+
+    // 获取 volume 配置
+    let volume_config = config.volume.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("配置文件中缺少 'volume' 字段！请在 config.json 中添加刷量账户配置。\n\n示例:\n\"volume\": {{\n  \"exchange\": \"mexc\",\n  \"account1\": {{\n    \"api_key\": \"账户1的API_KEY\",\n    \"api_secret\": \"账户1的API_SECRET\"\n  }},\n  \"account2\": {{\n    \"api_key\": \"账户2的API_KEY\",\n    \"api_secret\": \"账户2的API_SECRET\"\n  }}\n}}")
+    })?;
+
+    // 使用命令行参数的value，如果为0则使用配置中的default_value
+    let actual_value = if value > 0.0 { value } else { volume_config.default_value };
+    let price_offset = volume_config.price_offset;
+    let enable_guard_order = volume_config.enable_guard_order;
+    let guard_price_offset = volume_config.guard_price_offset;
+    let guard_quantity_percent = volume_config.guard_quantity_percent;
+
+    println!("  初始方向: {} ({})",
+        if initial_direction == "buy" { "买入" } else { "卖出" },
+        initial_direction
+    );
+    println!("  目标成交金额: {:.2} USDT", actual_value);
+    println!("  价格偏移: {:.8}", price_offset);
+    println!("  防套利阻挡单: {}", if enable_guard_order { "启用" } else { "禁用" });
+    if enable_guard_order {
+        println!("    - 阻挡单价格偏移: {:.8}", guard_price_offset);
+        println!("    - 阻挡单数量: {:.2}% of maker", guard_quantity_percent);
+    }
+    println!("  交易对: {}", symbol);
+    println!("  每轮重复次数: {}", repeat);
+    println!("  重复间隔: {} 秒", interval);
+    println!("  切换方向次数: {}", toggle);
+    if toggle > 0 {
+        println!("  总执行次数: {} ({}轮 x {}次切换)", repeat * (toggle + 1), repeat, toggle + 1);
+    }
+
+    let exchange_name = &volume_config.exchange;
+    println!("  交易所: {}", exchange_name);
+    println!("  账户1 (Maker): {}...", &volume_config.account1.api_key[..8.min(volume_config.account1.api_key.len())]);
+    println!("  账户2 (Taker): {}...", &volume_config.account2.api_key[..8.min(volume_config.account2.api_key.len())]);
+    println!("{}", "═".repeat(60));
+
+    // 创建两个交易所客户端
+    let exchange_type: ExchangeType = serde_json::from_str(&format!("\"{}\"", exchange_name))
+        .context(format!("Invalid exchange type: {}", exchange_name))?;
+
+    let client1 = create_exchange(
+        &exchange_type,
+        volume_config.account1.api_key.clone(),
+        volume_config.account1.api_secret.clone(),
+        volume_config.account1.api_passphrase.clone(),
+    )?;
+
+    let client2 = create_exchange(
+        &exchange_type,
+        volume_config.account2.api_key.clone(),
+        volume_config.account2.api_secret.clone(),
+        volume_config.account2.api_passphrase.clone(),
+    )?;
+
+    // 检查两个账户的残余挂单
+    println!("\n📋 检查账户残余挂单...");
+    let open_orders1 = client1.get_open_orders(Some(&symbol)).await?;
+    let open_orders2 = client2.get_open_orders(Some(&symbol)).await?;
+
+    if open_orders1.is_empty() && open_orders2.is_empty() {
+        println!("  ✅ 两个账户均无残余挂单");
+    } else {
+        if !open_orders1.is_empty() {
+            println!("  ⚠️  账户1 有 {} 个残余挂单:", open_orders1.len());
+            for order in &open_orders1 {
+                let price: f64 = order.price.parse().unwrap_or(0.0);
+                let qty: f64 = order.orig_qty.parse().unwrap_or(0.0);
+                let executed: f64 = order.executed_qty.parse().unwrap_or(0.0);
+                println!("      {} | 价格: {:.6} | 数量: {:.4} | 已成交: {:.4} | ID: {}",
+                    order.side, price, qty, executed, order.order_id);
+            }
+        } else {
+            println!("  ✅ 账户1 无残余挂单");
+        }
+
+        if !open_orders2.is_empty() {
+            println!("  ⚠️  账户2 有 {} 个残余挂单:", open_orders2.len());
+            for order in &open_orders2 {
+                let price: f64 = order.price.parse().unwrap_or(0.0);
+                let qty: f64 = order.orig_qty.parse().unwrap_or(0.0);
+                let executed: f64 = order.executed_qty.parse().unwrap_or(0.0);
+                println!("      {} | 价格: {:.6} | 数量: {:.4} | 已成交: {:.4} | ID: {}",
+                    order.side, price, qty, executed, order.order_id);
+            }
+        } else {
+            println!("  ✅ 账户2 无残余挂单");
+        }
+    }
+
+    // 获取订单簿
+    println!("\n📖 获取订单簿...");
+    let order_book = client1.get_order_book(&symbol, Some(5)).await?;
+
+    if order_book.bids.is_empty() || order_book.asks.is_empty() {
+        anyhow::bail!("Order book is empty");
+    }
+
+    let best_bid: f64 = order_book.bids[0][0].parse().context("Failed to parse best bid")?;
+    let best_ask: f64 = order_book.asks[0][0].parse().context("Failed to parse best ask")?;
+
+    println!("  Best Bid: {:.6}", best_bid);
+    println!("  Best Ask: {:.6}", best_ask);
+    println!("  Spread: {:.6} ({:.4}%)", best_ask - best_bid, (best_ask - best_bid) / best_bid * 100.0);
+
+    // 计算对敲价格（使用中位价）
+    let mid_price = (best_bid + best_ask) / 2.0;
+    println!("  Mid Price: {:.6}", mid_price);
+
+    let trade_price = mid_price;
+
+    // 确保价格在bid-ask之间（安全区间）
+    let trade_price = if trade_price < best_bid {
+        println!("⚠️  计算价格 {:.6} 低于 best_bid，调整为 best_bid", trade_price);
+        best_bid
+    } else if trade_price > best_ask {
+        println!("⚠️  计算价格 {:.6} 高于 best_ask，调整为 best_ask", trade_price);
+        best_ask
+    } else {
+        trade_price
+    };
+
+    // 计算数量
+    let quantity = actual_value / trade_price;
+
+    println!("\n💰 对敲参数:");
+    println!("  成交价格: {:.6}", trade_price);
+    println!("  成交数量: {:.6}", quantity);
+    println!("  成交金额: {:.2} USDT", trade_price * quantity);
+
+    // 获取资产名称
+    let (base_asset, quote_asset) = client1.get_symbol_assets(&symbol);
+
+    // 检查账户余额
+    println!("\n💼 检查账户余额...");
+
+    let account1_info = client1.get_account_info().await?;
+    let account2_info = client2.get_account_info().await?;
+
+    // 账户1余额
+    let mut account1_base = 0.0;
+    let mut account1_quote = 0.0;
+    for balance in &account1_info.balances {
+        if balance.asset == base_asset {
+            account1_base = balance.free.parse().unwrap_or(0.0);
+        } else if balance.asset == quote_asset {
+            account1_quote = balance.free.parse().unwrap_or(0.0);
+        }
+    }
+
+    // 账户2余额
+    let mut account2_base = 0.0;
+    let mut account2_quote = 0.0;
+    for balance in &account2_info.balances {
+        if balance.asset == base_asset {
+            account2_base = balance.free.parse().unwrap_or(0.0);
+        } else if balance.asset == quote_asset {
+            account2_quote = balance.free.parse().unwrap_or(0.0);
+        }
+    }
+
+    println!("  账户1: {:.4} {} | {:.2} {}", account1_base, base_asset, account1_quote, quote_asset);
+    println!("  账户2: {:.4} {} | {:.2} {}", account2_base, base_asset, account2_quote, quote_asset);
+
+    // 验证余额（检查两个方向的余额，因为toggle会切换方向）
+    if toggle > 0 {
+        // 如果有toggle，需要两个方向的余额都足够
+        if account1_base < quantity {
+            anyhow::bail!(
+                "账户1 {} 余额不足！需要 {:.6}，可用 {:.6}",
+                base_asset, quantity, account1_base
+            );
+        }
+        if account1_quote < actual_value {
+            anyhow::bail!(
+                "账户1 {} 余额不足！需要 {:.2}，可用 {:.2}",
+                quote_asset, actual_value, account1_quote
+            );
+        }
+        if account2_base < quantity {
+            anyhow::bail!(
+                "账户2 {} 余额不足！需要 {:.6}，可用 {:.6}",
+                base_asset, quantity, account2_base
+            );
+        }
+        if account2_quote < actual_value {
+            anyhow::bail!(
+                "账户2 {} 余额不足！需要 {:.2}，可用 {:.2}",
+                quote_asset, actual_value, account2_quote
+            );
+        }
+    } else if initial_direction == "buy" {
+        // 买入成交：账户1卖出base，账户2买入base
+        if account1_base < quantity {
+            anyhow::bail!(
+                "账户1 {} 余额不足！需要 {:.6}，可用 {:.6}",
+                base_asset, quantity, account1_base
+            );
+        }
+        if account2_quote < actual_value {
+            anyhow::bail!(
+                "账户2 {} 余额不足！需要 {:.2}，可用 {:.2}",
+                quote_asset, actual_value, account2_quote
+            );
+        }
+    } else {
+        // 卖出成交：账户1买入base，账户2卖出base
+        if account1_quote < actual_value {
+            anyhow::bail!(
+                "账户1 {} 余额不足！需要 {:.2}，可用 {:.2}",
+                quote_asset, actual_value, account1_quote
+            );
+        }
+        if account2_base < quantity {
+            anyhow::bail!(
+                "账户2 {} 余额不足！需要 {:.6}，可用 {:.6}",
+                base_asset, quantity, account2_base
+            );
+        }
+    }
+
+    println!("\n✅ 余额检查通过");
+
+    // 记录初始总余额（用于后续比较）
+    let initial_total_base = account1_base + account2_base;
+    let initial_total_quote = account1_quote + account2_quote;
+    let mut prev_total_base = initial_total_base;
+    let mut prev_total_quote = initial_total_quote;
+
+    println!("\n📊 初始总余额:");
+    println!("  {} 总量: {:.8}", base_asset, initial_total_base);
+    println!("  {} 总量: {:.8}", quote_asset, initial_total_quote);
+
+    // 确认操作
+    println!("\n{}", "═".repeat(60));
+    println!("⚠️  即将执行对敲交易！");
+    println!("{}", "═".repeat(60));
+
+    if initial_direction == "buy" {
+        println!("  首轮步骤1: 账户1 挂卖单 {:.6} {} @ {:.6}", quantity, base_asset, trade_price);
+        println!("  首轮步骤2: 账户2 挂买单 {:.6} {} @ {:.6} (吃掉账户1的卖单)", quantity, base_asset, trade_price);
+    } else {
+        println!("  首轮步骤1: 账户1 挂买单 {:.6} {} @ {:.6}", quantity, base_asset, trade_price);
+        println!("  首轮步骤2: 账户2 挂卖单 {:.6} {} @ {:.6} (吃掉账户1的买单)", quantity, base_asset, trade_price);
+    }
+    if toggle > 0 {
+        println!("  (之后将切换方向 {} 次)", toggle);
+    }
+
+    // 如果重复次数大于1或toggle大于0，跳过确认直接执行
+    if repeat == 1 && toggle == 0 {
+        println!("\n❓ 确认执行？输入 'yes' 继续: ");
+        print!("> ");
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        if input.trim().to_lowercase() != "yes" {
+            println!("\n❌ 操作已取消");
+            return Ok(());
+        }
+    } else {
+        let total_rounds = repeat * (toggle + 1);
+        println!("\n🔄 批量模式 (共 {} 次执行)，跳过确认直接执行...", total_rounds);
+    }
+
+    // 外层循环：处理toggle切换
+    let mut current_direction = initial_direction.clone();
+    for toggle_round in 0..=toggle {
+        if toggle > 0 {
+            println!("\n{}", "═".repeat(60));
+            println!("🔀 第 {}/{} 轮方向: {} ({})",
+                toggle_round + 1,
+                toggle + 1,
+                if current_direction == "buy" { "买入" } else { "卖出" },
+                current_direction
+            );
+            println!("{}", "═".repeat(60));
+        }
+
+        // 内层循环：执行repeat次
+        for round in 1..=repeat {
+            if repeat > 1 {
+                println!("\n{}", "─".repeat(40));
+                println!("📊 第 {}/{} 次执行", round, repeat);
+                println!("{}", "─".repeat(40));
+            }
+
+            // 每轮重新获取订单簿（带重试）
+            println!("\n📖 获取最新订单簿...");
+            let order_book = loop {
+                match client1.get_order_book(&symbol, Some(5)).await {
+                    Ok(ob) => break ob,
+                    Err(e) => {
+                        println!("  ⚠️  获取订单簿失败: {}", e);
+                        println!("  🔄 20秒后重试...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                        continue;
+                    }
+                }
+            };
+
+            if order_book.bids.is_empty() || order_book.asks.is_empty() {
+                println!("  ❌ Order book is empty，跳过本轮");
+                continue;
+            }
+
+            let best_bid: f64 = order_book.bids[0][0].parse().context("Failed to parse best bid")?;
+            let best_ask: f64 = order_book.asks[0][0].parse().context("Failed to parse best ask")?;
+
+            println!("  Best Bid: {:.6}", best_bid);
+            println!("  Best Ask: {:.6}", best_ask);
+
+            // 重新计算对敲价格
+            let trade_price = if current_direction == "buy" {
+                best_ask - price_offset
+            } else {
+                best_bid + price_offset
+            };
+
+            let trade_price = if trade_price < best_bid {
+                best_bid
+            } else if trade_price > best_ask {
+                best_ask
+            } else {
+                trade_price
+            };
+
+            let quantity = actual_value / trade_price;
+
+            println!("  成交价格: {:.6}", trade_price);
+            println!("  成交数量: {:.6}", quantity);
+
+            println!("\n🚀 开始执行对敲...");
+
+            // 保存订单信息用于最后打印
+            let (maker_order, taker_order, guard_order_id) = if current_direction == "buy" {
+                // 步骤1: 账户1挂卖单（maker）+ 阻挡买单（防套利）- 带网络重试
+                // 阻挡买单价格微微低于maker卖单，挡在卖单下方保护maker单
+                let guard_buy_price = trade_price - guard_price_offset;
+                let guard_quantity = quantity * guard_quantity_percent / 100.0;
+
+                let (maker, guard_id) = if enable_guard_order {
+                    println!("\n📤 步骤1: 账户1 Batch挂卖单 + 阻挡买单...");
+                    println!("    - Maker卖单: 价格={:.6}, 数量={:.6}", trade_price, quantity);
+                    println!("    - 阻挡买单: 价格={:.6}, 数量={:.6} ({:.2}%)", guard_buy_price, guard_quantity, guard_quantity_percent);
+
+                    let batch_orders = vec![
+                        BatchOrder {
+                            symbol: symbol.clone(),
+                            side: "SELL".to_string(),
+                            quantity,
+                            price: trade_price,
+                        },
+                        BatchOrder {
+                            symbol: symbol.clone(),
+                            side: "BUY".to_string(),
+                            quantity: guard_quantity,
+                            price: guard_buy_price,
+                        },
+                    ];
+
+                    let batch_result = loop {
+                        match client1.place_batch_limit_orders(batch_orders.clone()).await {
+                            Ok(results) => break results,
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                if err_str.contains("dns error") || err_str.contains("error sending request") || err_str.contains("connection") {
+                                    println!("  ⚠️  网络错误: {}", e);
+                                    println!("  🔄 20秒后重试...");
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                                    continue;
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    };
+
+                    // 解析batch结果
+                    let mut batch_iter = batch_result.into_iter();
+                    let maker_result = batch_iter.next().ok_or_else(|| anyhow::anyhow!("Batch返回结果为空"))?;
+                    let guard_result = batch_iter.next();
+
+                    let maker = match maker_result {
+                        Ok(order) => {
+                            println!("  ✅ Maker卖单已挂出，订单ID: {}", order.order_id);
+                            order
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("Maker卖单下单失败: {}", e));
+                        }
+                    };
+
+                    let guard_id = match guard_result {
+                        Some(Ok(order)) => {
+                            println!("  ✅ 阻挡买单已挂出，订单ID: {}", order.order_id);
+                            Some(order.order_id)
+                        }
+                        Some(Err(e)) => {
+                            println!("  ⚠️  阻挡买单失败: {}（继续执行）", e);
+                            None
+                        }
+                        None => {
+                            println!("  ⚠️  阻挡买单无返回（继续执行）");
+                            None
+                        }
+                    };
+
+                    (maker, guard_id)
+                } else {
+                    // 不启用阻挡单，使用原有逻辑
+                    println!("\n📤 步骤1: 账户1 挂卖单...");
+                    let maker = loop {
+                        match client1.place_limit_order(&symbol, "SELL", quantity, trade_price).await {
+                            Ok(order) => break order,
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                if err_str.contains("dns error") || err_str.contains("error sending request") || err_str.contains("connection") {
+                                    println!("  ⚠️  网络错误: {}", e);
+                                    println!("  🔄 20秒后重试...");
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                                    continue;
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    };
+                    println!("  ✅ 卖单已挂出，订单ID: {}", maker.order_id);
+                    (maker, None::<String>)
+                };
+
+                // 短暂等待确保订单进入订单簿
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                // 检查maker单是否是最低卖价（best ask）且没有同价位的其他单
+                println!("\n🔍 检查maker单是否为最优价...");
+                let check_order_book = match client1.get_order_book(&symbol, Some(5)).await {
+                    Ok(ob) => ob,
+                    Err(e) => {
+                        println!("  ⚠️  获取订单簿失败: {}，跳过检查", e);
+                        // 获取失败时继续执行，不撤单
+                        OrderBook { bids: vec![], asks: vec![] }
+                    }
+                };
+
+                if !check_order_book.asks.is_empty() {
+                    let current_best_ask: f64 = check_order_book.asks[0][0].parse().unwrap_or(0.0);
+                    let best_ask_qty: f64 = check_order_book.asks[0][1].parse().unwrap_or(0.0);
+                    println!("  当前最低卖价: {:.6}，数量: {:.6}", current_best_ask, best_ask_qty);
+                    println!("  Maker卖单价格: {:.6}，数量: {:.6}", trade_price, quantity);
+
+                    let price_diff = (trade_price - current_best_ask).abs();
+                    let need_retry = if price_diff > 0.0000001 && trade_price > current_best_ask {
+                        // 有更低价格的卖单
+                        println!("  ❌ Maker卖单不是最低卖价！有其他卖单价格更低");
+                        true
+                    } else if price_diff <= 0.0000001 && best_ask_qty > quantity * 1.01 {
+                        // 价格相同，但该价位总数量大于我们的订单，说明有其他单排在前面
+                        println!("  ❌ 同价位有其他卖单！(订单簿数量 {:.6} > 我们的 {:.6})", best_ask_qty, quantity);
+                        true
+                    } else {
+                        false
+                    };
+
+                    if need_retry {
+                        println!("  🔄 撤单并重新计算价格...");
+                        // 撤销maker单
+                        if let Err(cancel_err) = client1.cancel_order(&symbol, &maker.order_id).await {
+                            println!("  ⚠️  撤销Maker单失败: {}", cancel_err);
+                        } else {
+                            println!("  ✅ Maker单已撤销");
+                        }
+                        // 撤销阻挡单
+                        if let Some(ref gid) = guard_id {
+                            if let Err(cancel_err) = client1.cancel_order(&symbol, gid).await {
+                                println!("  ⚠️  撤销阻挡单失败: {}", cancel_err);
+                            } else {
+                                println!("  ✅ 阻挡单已撤销");
+                            }
+                        }
+                        // 短暂等待后重试
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    println!("  ✅ Maker卖单是唯一最低卖价，继续执行");
+                }
+
+                // 步骤2: 账户2挂买单（taker）- 带网络重试
+                println!("\n📥 步骤2: 账户2 挂买单（吃单）...");
+                let taker_result = loop {
+                    match client2.place_limit_order(&symbol, "BUY", quantity, trade_price).await {
+                        Ok(order) => break Ok(order),
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("dns error") || err_str.contains("error sending request") || err_str.contains("connection") {
+                                println!("  ⚠️  网络错误: {}", e);
+                                println!("  🔄 20秒后重试...");
+                                tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                                continue;
+                            } else {
+                                break Err(e);
+                            }
+                        }
+                    }
+                };
+                match taker_result {
+                    Ok(taker) => (maker, taker, guard_id),
+                    Err(e) => {
+                        println!("  ❌ 买单失败: {}", e);
+                        println!("  ⚠️  正在取消账户1的挂单...");
+                        if let Err(cancel_err) = client1.cancel_order(&symbol, &maker.order_id).await {
+                            println!("  ❌ 取消Maker挂单失败: {}", cancel_err);
+                        } else {
+                            println!("  ✅ Maker挂单已取消");
+                        }
+                        // 取消阻挡单
+                        if let Some(ref gid) = guard_id {
+                            if let Err(cancel_err) = client1.cancel_order(&symbol, gid).await {
+                                println!("  ❌ 取消阻挡单失败: {}", cancel_err);
+                            } else {
+                                println!("  ✅ 阻挡单已取消");
+                            }
+                        }
+                        if round < repeat {
+                            println!("\n⏳ 等待 {} 秒后进行下一轮...", interval);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                // 步骤1: 账户1挂买单（maker）+ 阻挡卖单（防套利）- 带网络重试
+                // 阻挡卖单价格微微高于maker买单，挡在买单上方保护maker单
+                let guard_sell_price = trade_price + guard_price_offset;
+                let guard_quantity = quantity * guard_quantity_percent / 100.0;
+
+                let (maker, guard_id) = if enable_guard_order {
+                    println!("\n📥 步骤1: 账户1 Batch挂买单 + 阻挡卖单...");
+                    println!("    - Maker买单: 价格={:.6}, 数量={:.6}", trade_price, quantity);
+                    println!("    - 阻挡卖单: 价格={:.6}, 数量={:.6} ({:.2}%)", guard_sell_price, guard_quantity, guard_quantity_percent);
+
+                    let batch_orders = vec![
+                        BatchOrder {
+                            symbol: symbol.clone(),
+                            side: "BUY".to_string(),
+                            quantity,
+                            price: trade_price,
+                        },
+                        BatchOrder {
+                            symbol: symbol.clone(),
+                            side: "SELL".to_string(),
+                            quantity: guard_quantity,
+                            price: guard_sell_price,
+                        },
+                    ];
+
+                    let batch_result = loop {
+                        match client1.place_batch_limit_orders(batch_orders.clone()).await {
+                            Ok(results) => break results,
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                if err_str.contains("dns error") || err_str.contains("error sending request") || err_str.contains("connection") {
+                                    println!("  ⚠️  网络错误: {}", e);
+                                    println!("  🔄 20秒后重试...");
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                                    continue;
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    };
+
+                    // 解析batch结果
+                    let mut batch_iter = batch_result.into_iter();
+                    let maker_result = batch_iter.next().ok_or_else(|| anyhow::anyhow!("Batch返回结果为空"))?;
+                    let guard_result = batch_iter.next();
+
+                    let maker = match maker_result {
+                        Ok(order) => {
+                            println!("  ✅ Maker买单已挂出，订单ID: {}", order.order_id);
+                            order
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("Maker买单下单失败: {}", e));
+                        }
+                    };
+
+                    let guard_id = match guard_result {
+                        Some(Ok(order)) => {
+                            println!("  ✅ 阻挡卖单已挂出，订单ID: {}", order.order_id);
+                            Some(order.order_id)
+                        }
+                        Some(Err(e)) => {
+                            println!("  ⚠️  阻挡卖单失败: {}（继续执行）", e);
+                            None
+                        }
+                        None => {
+                            println!("  ⚠️  阻挡卖单无返回（继续执行）");
+                            None
+                        }
+                    };
+
+                    (maker, guard_id)
+                } else {
+                    // 不启用阻挡单，使用原有逻辑
+                    println!("\n📥 步骤1: 账户1 挂买单...");
+                    let maker = loop {
+                        match client1.place_limit_order(&symbol, "BUY", quantity, trade_price).await {
+                            Ok(order) => break order,
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                if err_str.contains("dns error") || err_str.contains("error sending request") || err_str.contains("connection") {
+                                    println!("  ⚠️  网络错误: {}", e);
+                                    println!("  🔄 20秒后重试...");
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                                    continue;
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    };
+                    println!("  ✅ 买单已挂出，订单ID: {}", maker.order_id);
+                    (maker, None::<String>)
+                };
+
+                // 短暂等待确保订单进入订单簿
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                // 检查maker单是否是最高买价（best bid）且没有同价位的其他单
+                println!("\n🔍 检查maker单是否为最优价...");
+                let check_order_book = match client1.get_order_book(&symbol, Some(5)).await {
+                    Ok(ob) => ob,
+                    Err(e) => {
+                        println!("  ⚠️  获取订单簿失败: {}，跳过检查", e);
+                        // 获取失败时继续执行，不撤单
+                        OrderBook { bids: vec![], asks: vec![] }
+                    }
+                };
+
+                if !check_order_book.bids.is_empty() {
+                    let current_best_bid: f64 = check_order_book.bids[0][0].parse().unwrap_or(0.0);
+                    let best_bid_qty: f64 = check_order_book.bids[0][1].parse().unwrap_or(0.0);
+                    println!("  当前最高买价: {:.6}，数量: {:.6}", current_best_bid, best_bid_qty);
+                    println!("  Maker买单价格: {:.6}，数量: {:.6}", trade_price, quantity);
+
+                    let price_diff = (trade_price - current_best_bid).abs();
+                    let need_retry = if price_diff > 0.0000001 && trade_price < current_best_bid {
+                        // 有更高价格的买单
+                        println!("  ❌ Maker买单不是最高买价！有其他买单价格更高");
+                        true
+                    } else if price_diff <= 0.0000001 && best_bid_qty > quantity * 1.01 {
+                        // 价格相同，但该价位总数量大于我们的订单，说明有其他单排在前面
+                        println!("  ❌ 同价位有其他买单！(订单簿数量 {:.6} > 我们的 {:.6})", best_bid_qty, quantity);
+                        true
+                    } else {
+                        false
+                    };
+
+                    if need_retry {
+                        println!("  🔄 撤单并重新计算价格...");
+                        // 撤销maker单
+                        if let Err(cancel_err) = client1.cancel_order(&symbol, &maker.order_id).await {
+                            println!("  ⚠️  撤销Maker单失败: {}", cancel_err);
+                        } else {
+                            println!("  ✅ Maker单已撤销");
+                        }
+                        // 撤销阻挡单
+                        if let Some(ref gid) = guard_id {
+                            if let Err(cancel_err) = client1.cancel_order(&symbol, gid).await {
+                                println!("  ⚠️  撤销阻挡单失败: {}", cancel_err);
+                            } else {
+                                println!("  ✅ 阻挡单已撤销");
+                            }
+                        }
+                        // 短暂等待后重试
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    println!("  ✅ Maker买单是唯一最高买价，继续执行");
+                }
+
+                // 步骤2: 账户2挂卖单（taker）- 带网络重试
+                println!("\n📤 步骤2: 账户2 挂卖单（吃单）...");
+                let taker_result = loop {
+                    match client2.place_limit_order(&symbol, "SELL", quantity, trade_price).await {
+                        Ok(order) => break Ok(order),
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("dns error") || err_str.contains("error sending request") || err_str.contains("connection") {
+                                println!("  ⚠️  网络错误: {}", e);
+                                println!("  🔄 20秒后重试...");
+                                tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                                continue;
+                            } else {
+                                break Err(e);
+                            }
+                        }
+                    }
+                };
+                match taker_result {
+                    Ok(taker) => (maker, taker, guard_id),
+                    Err(e) => {
+                        println!("  ❌ 卖单失败: {}", e);
+                        println!("  ⚠️  正在取消账户1的挂单...");
+                        if let Err(cancel_err) = client1.cancel_order(&symbol, &maker.order_id).await {
+                            println!("  ❌ 取消Maker挂单失败: {}", cancel_err);
+                        } else {
+                            println!("  ✅ Maker挂单已取消");
+                        }
+                        // 取消阻挡单
+                        if let Some(ref gid) = guard_id {
+                            if let Err(cancel_err) = client1.cancel_order(&symbol, gid).await {
+                                println!("  ❌ 取消阻挡单失败: {}", cancel_err);
+                            } else {
+                                println!("  ✅ 阻挡单已取消");
+                            }
+                        }
+                        if round < repeat {
+                            println!("\n⏳ 等待 {} 秒后进行下一轮...", interval);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                        }
+                        continue;
+                    }
+                }
+            };
+
+            // 等待订单处理
+            println!("\n🔍 检查订单成交状态...");
+            println!("  Maker 订单ID: {}", maker_order.order_id);
+            println!("  Taker 订单ID: {}", taker_order.order_id);
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+            // 取消阻挡单（无论成交与否都应取消）
+            if let Some(ref gid) = guard_order_id {
+                println!("\n🛡️ 取消阻挡单...");
+                match client1.cancel_order(&symbol, gid).await {
+                    Ok(_) => println!("  ✅ 阻挡单已取消 (ID: {})", gid),
+                    Err(e) => {
+                        // 可能已经成交或已取消
+                        let err_str = e.to_string().to_lowercase();
+                        if err_str.contains("filled") || err_str.contains("已成交") || err_str.contains("not exist") || err_str.contains("order_not_found") {
+                            println!("  ⚠️  阻挡单已成交或不存在（可能被套利者触发）");
+                        } else {
+                            println!("  ⚠️  取消阻挡单失败: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // 查询 Maker 订单状态（带超时，超时则取消订单）
+            println!("  查询 Maker 订单状态...");
+            let maker_status = match tokio::time::timeout(
+                tokio::time::Duration::from_secs(30),
+                client1.get_order(&symbol, &maker_order.order_id)
+            ).await {
+                Ok(Ok(order)) => Some(order),
+                Ok(Err(e)) => {
+                    println!("  ⚠️  查询 Maker 订单失败: {}", e);
+                    println!("  🔄 尝试取消 Maker 订单...");
+                    let _ = client1.cancel_order(&symbol, &maker_order.order_id).await;
+                    None
+                }
+                Err(_) => {
+                    println!("  ⚠️  查询 Maker 订单超时（30秒）");
+                    println!("  🔄 尝试取消 Maker 订单...");
+                    match client1.cancel_order(&symbol, &maker_order.order_id).await {
+                        Ok(_) => println!("  ✅ Maker 订单已取消"),
+                        Err(e) => println!("  ❌ 取消 Maker 订单失败: {}", e),
+                    }
+                    None
+                }
+            };
+
+            // 查询 Taker 订单状态（带超时，超时则取消订单）
+            println!("  查询 Taker 订单状态...");
+            let taker_status = match tokio::time::timeout(
+                tokio::time::Duration::from_secs(30),
+                client2.get_order(&symbol, &taker_order.order_id)
+            ).await {
+                Ok(Ok(order)) => Some(order),
+                Ok(Err(e)) => {
+                    println!("  ⚠️  查询 Taker 订单失败: {}", e);
+                    println!("  🔄 尝试取消 Taker 订单...");
+                    let _ = client2.cancel_order(&symbol, &taker_order.order_id).await;
+                    None
+                }
+                Err(_) => {
+                    println!("  ⚠️  查询 Taker 订单超时（30秒）");
+                    println!("  🔄 尝试取消 Taker 订单...");
+                    match client2.cancel_order(&symbol, &taker_order.order_id).await {
+                        Ok(_) => println!("  ✅ Taker 订单已取消"),
+                        Err(e) => println!("  ❌ 取消 Taker 订单失败: {}", e),
+                    }
+                    None
+                }
+            };
+
+            // 打印详细订单信息
+            println!("\n{}", "─".repeat(40));
+            println!("🎉 本次对敲完成！");
+            println!("{}", "─".repeat(40));
+
+            println!("\n📋 Maker 订单 (账户1):");
+            println!("  订单ID:    {}", maker_order.order_id);
+            println!("  方向:      {}", maker_order.side);
+            println!("  价格:      {}", maker_order.price);
+            println!("  下单数量:  {}", maker_order.orig_qty);
+            if let Some(ref status) = maker_status {
+                println!("  成交数量:  {}", status.executed_qty);
+                println!("  订单状态:  {}", status.status);
+            }
+
+            println!("\n📋 Taker 订单 (账户2):");
+            println!("  订单ID:    {}", taker_order.order_id);
+            println!("  方向:      {}", taker_order.side);
+            println!("  价格:      {}", taker_order.price);
+            println!("  下单数量:  {}", taker_order.orig_qty);
+            if let Some(ref status) = taker_status {
+                println!("  成交数量:  {}", status.executed_qty);
+                println!("  订单状态:  {}", status.status);
+            }
+
+            // 检查并取消未完全成交的订单
+            let mut need_cancel = false;
+
+            if let Some(ref status) = maker_status {
+                if status.status != "FILLED" && status.status != "CANCELED" {
+                    println!("\n  ⚠️  Maker订单未完全成交 (状态: {})", status.status);
+                    need_cancel = true;
+                    match client1.cancel_order(&symbol, &maker_order.order_id).await {
+                        Ok(_) => println!("  ✅ Maker订单已取消"),
+                        Err(e) => println!("  ❌ 取消Maker订单失败: {}", e),
+                    }
+                }
+            }
+
+            if let Some(ref status) = taker_status {
+                if status.status != "FILLED" && status.status != "CANCELED" {
+                    println!("\n  ⚠️  Taker订单未完全成交 (状态: {})", status.status);
+                    need_cancel = true;
+                    match client2.cancel_order(&symbol, &taker_order.order_id).await {
+                        Ok(_) => println!("  ✅ Taker订单已取消"),
+                        Err(e) => println!("  ❌ 取消Taker订单失败: {}", e),
+                    }
+                }
+            }
+
+            if !need_cancel {
+                println!("\n  ✅ 两个订单都已完全成交");
+            }
+
+            println!("\n📊 本次成交汇总:");
+            println!("  成交方向:  {}", if current_direction == "buy" { "买入" } else { "卖出" });
+            println!("  成交价格:  {:.8}", trade_price);
+            println!("  成交数量:  {:.8} {}", quantity, base_asset);
+            println!("  成交金额:  {:.4} {}", trade_price * quantity, quote_asset);
+
+            // 查询当前两个账户的余额总量
+            println!("\n💰 余额变化检查...");
+            let acc1_info = client1.get_account_info().await?;
+            let acc2_info = client2.get_account_info().await?;
+
+            let mut curr_acc1_base = 0.0;
+            let mut curr_acc1_quote = 0.0;
+            for balance in &acc1_info.balances {
+                if balance.asset == base_asset {
+                    curr_acc1_base = balance.free.parse().unwrap_or(0.0);
+                } else if balance.asset == quote_asset {
+                    curr_acc1_quote = balance.free.parse().unwrap_or(0.0);
+                }
+            }
+
+            let mut curr_acc2_base = 0.0;
+            let mut curr_acc2_quote = 0.0;
+            for balance in &acc2_info.balances {
+                if balance.asset == base_asset {
+                    curr_acc2_base = balance.free.parse().unwrap_or(0.0);
+                } else if balance.asset == quote_asset {
+                    curr_acc2_quote = balance.free.parse().unwrap_or(0.0);
+                }
+            }
+
+            let curr_total_base = curr_acc1_base + curr_acc2_base;
+            let curr_total_quote = curr_acc1_quote + curr_acc2_quote;
+
+            // 计算与上一轮的差值
+            let diff_base = curr_total_base - prev_total_base;
+            let diff_quote = curr_total_quote - prev_total_quote;
+
+            // 计算与初始的差值
+            let diff_from_initial_base = curr_total_base - initial_total_base;
+            let diff_from_initial_quote = curr_total_quote - initial_total_quote;
+
+            println!("  账户1: {:.8} {} | {:.4} {}", curr_acc1_base, base_asset, curr_acc1_quote, quote_asset);
+            println!("  账户2: {:.8} {} | {:.4} {}", curr_acc2_base, base_asset, curr_acc2_quote, quote_asset);
+            println!("  ────────────────────────────────────");
+            println!("  总量:   {:.8} {} | {:.4} {}", curr_total_base, base_asset, curr_total_quote, quote_asset);
+
+            // 显示本轮变化
+            let base_sign = if diff_base >= 0.0 { "+" } else { "" };
+            let quote_sign = if diff_quote >= 0.0 { "+" } else { "" };
+            println!("  本轮变化: {}{:.8} {} | {}{:.4} {}",
+                base_sign, diff_base, base_asset,
+                quote_sign, diff_quote, quote_asset);
+
+            // 显示累计变化
+            let init_base_sign = if diff_from_initial_base >= 0.0 { "+" } else { "" };
+            let init_quote_sign = if diff_from_initial_quote >= 0.0 { "+" } else { "" };
+            println!("  累计变化: {}{:.8} {} | {}{:.4} {}",
+                init_base_sign, diff_from_initial_base, base_asset,
+                init_quote_sign, diff_from_initial_quote, quote_asset);
+
+            // 检测异常：base 减少换算成 USDT > 1 或 quote 减少 > 1
+            let base_loss_usdt = -diff_base * trade_price;
+            let quote_loss = -diff_quote;
+            if base_loss_usdt > 1.0 || quote_loss > 1.0 {
+                println!("  ⚠️  警告: 本轮余额减少超过 1 USDT，可能被套利!");
+            }
+
+            let init_base_loss_usdt = -diff_from_initial_base * trade_price;
+            let init_quote_loss = -diff_from_initial_quote;
+            if init_base_loss_usdt > 1.0 || init_quote_loss > 1.0 {
+                println!("  🚨 警告: 累计余额减少超过 1 USDT，策略可能被套利!");
+            }
+
+            // 更新上一轮余额
+            prev_total_base = curr_total_base;
+            prev_total_quote = curr_total_quote;
+
+            // 如果还有下一轮，等待间隔时间
+            if round < repeat {
+                println!("\n⏳ 等待 {} 秒后进行第 {}/{} 次...", interval, round + 1, repeat);
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+            }
+        } // 内层循环结束
+
+        // 如果还有下一轮toggle，切换方向并等待
+        if toggle_round < toggle {
+            current_direction = if current_direction == "buy" {
+                "sell".to_string()
+            } else {
+                "buy".to_string()
+            };
+            println!("\n⏳ 等待 {} 秒后切换方向到 {}...", interval, current_direction);
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        }
+    } // 外层循环结束
+
+    let total_executions = repeat * (toggle + 1);
+    println!("\n{}", "═".repeat(60));
+    println!("✅ 全部 {} 次对敲执行完毕！", total_executions);
+    if toggle > 0 {
+        println!("   (共 {} 轮方向切换，每轮 {} 次)", toggle + 1, repeat);
+    }
+    println!("{}", "═".repeat(60));
 
     Ok(())
 }

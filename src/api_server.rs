@@ -131,6 +131,15 @@ pub struct TradeStatsSummary {
     pub sell_count: usize,
     pub net_quantity: f64,
     pub realized_pnl: f64,
+    // 24小时统计
+    pub buy_24h_quantity: f64,
+    pub buy_24h_cost: f64,
+    pub buy_24h_avg_price: f64,
+    pub buy_24h_count: usize,
+    pub sell_24h_quantity: f64,
+    pub sell_24h_revenue: f64,
+    pub sell_24h_avg_price: f64,
+    pub sell_24h_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -293,7 +302,7 @@ async fn fetch_exchange_report_with_snapshot(
     let (base_asset, quote_asset) = client.get_symbol_assets(symbol);
 
     // Fetch account info
-    let account_info = fetch_account_info(&client, symbol, &base_asset, &quote_asset).await?;
+    let account_info = fetch_account_info(&client, &base_asset, &quote_asset).await?;
 
     // Fetch market depth
     let market_depth = fetch_market_depth(&client, symbol).await?;
@@ -338,7 +347,6 @@ async fn fetch_exchange_report_with_snapshot(
 
 async fn fetch_account_info(
     client: &Arc<dyn Exchange>,
-    symbol: &str,
     base_asset: &str,
     quote_asset: &str,
 ) -> Result<AccountInfo> {
@@ -730,6 +738,14 @@ fn fetch_pnl_summary(
                                 sell_count: stats.sell_count,
                                 net_quantity: stats.net_quantity,
                                 realized_pnl: stats.realized_pnl,
+                                buy_24h_quantity: stats.buy_24h_quantity,
+                                buy_24h_cost: stats.buy_24h_cost,
+                                buy_24h_avg_price: stats.buy_24h_avg_price,
+                                buy_24h_count: stats.buy_24h_count,
+                                sell_24h_quantity: stats.sell_24h_quantity,
+                                sell_24h_revenue: stats.sell_24h_revenue,
+                                sell_24h_avg_price: stats.sell_24h_avg_price,
+                                sell_24h_count: stats.sell_24h_count,
                             }),
                             Err(_) => None,
                         }
