@@ -105,6 +105,9 @@ enum Commands {
         /// 配置文件路径
         #[arg(default_value = "config.json")]
         config: String,
+        /// 选择交易所（不指定则使用配置中的第一个）
+        #[arg(short = 'c', long)]
+        exchange: Option<String>,
         /// 方向：buy（制造买入成交）或 sell（制造卖出成交）
         #[arg(short, long)]
         direction: String,
@@ -154,8 +157,8 @@ async fn main() -> Result<()> {
         Commands::TradeStats { config, exchange, limit } => {
             show_trade_stats(&config, &exchange, limit).await?;
         }
-        Commands::CreateVolume { config, direction, value, repeat, interval, toggle } => {
-            create_volume(&config, &direction, value, repeat, interval, toggle).await?;
+        Commands::CreateVolume { config, exchange, direction, value, repeat, interval, toggle } => {
+            create_volume(&config, exchange.as_deref(), &direction, value, repeat, interval, toggle).await?;
         }
     }
 
@@ -584,6 +587,7 @@ async fn get_exchange_mid_price(
         &config.mid_price_method_ask,
         all_orders.as_deref(),
         config.volume_threshold_usdt,
+        config.fix_mid_price,
     )?;
 
     Ok(price_result.mid_price)
@@ -882,6 +886,7 @@ async fn place_orders_for_exchange(
         &config.mid_price_method_ask,
         all_orders.as_deref(),
         config.volume_threshold_usdt,
+        config.fix_mid_price,
     )?;
 
     let current_price = price_result.mid_price;
@@ -1989,6 +1994,7 @@ async fn show_trade_stats(
 ///   - 账户2在相同价格挂卖单成交（taker）
 async fn create_volume(
     config_path: &str,
+    exchange: Option<&str>,
     direction: &str,
     value: f64,
     repeat: u32,
@@ -2009,13 +2015,22 @@ async fn create_volume(
     let symbol = config.grid.get_symbol().to_string();
 
     // 获取 volume 配置
-    let volume_config = config.volume.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("配置文件中缺少 'volume' 字段！请在 config.json 中添加刷量账户配置。\n\n示例:\n\"volume\": {{\n  \"exchange\": \"mexc\",\n  \"account1\": {{\n    \"api_key\": \"账户1的API_KEY\",\n    \"api_secret\": \"账户1的API_SECRET\"\n  }},\n  \"account2\": {{\n    \"api_key\": \"账户2的API_KEY\",\n    \"api_secret\": \"账户2的API_SECRET\"\n  }}\n}}")
+    let volume_wrapper = config.volume.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("配置文件中缺少 'volume' 字段！请在 config.json 中添加刷量账户配置。\n\n示例:\n\"volume\": {{\n  \"exchange\": \"mexc\",\n  \"account1\": {{\n    \"api_key\": \"账户1的API_KEY\",\n    \"api_secret\": \"账户1的API_SECRET\"\n  }},\n  \"account2\": {{\n    \"api_key\": \"账户2的API_KEY\",\n    \"api_secret\": \"账户2的API_SECRET\"\n  }}\n}}\n\n或者支持多个交易所:\n\"volume\": [\n  {{\n    \"exchange\": \"mexc\",\n    \"account1\": {{ ... }},\n    \"account2\": {{ ... }}\n  }},\n  {{\n    \"exchange\": \"gate\",\n    \"account1\": {{ ... }},\n    \"account2\": {{ ... }}\n  }}\n]")
+    })?;
+
+    // 根据 -c 参数选择交易所配置
+    let volume_config = volume_wrapper.get_exchange_config(exchange).ok_or_else(|| {
+        let available = volume_wrapper.available_exchanges().join(", ");
+        if let Some(ex) = exchange {
+            anyhow::anyhow!("未找到交易所 '{}' 的刷量配置！\n可用的交易所: {}", ex, available)
+        } else {
+            anyhow::anyhow!("未找到任何刷量配置！")
+        }
     })?;
 
     // 使用命令行参数的value，如果为0则使用配置中的default_value
     let actual_value = if value > 0.0 { value } else { volume_config.default_value };
-    let price_offset = volume_config.price_offset;
     let enable_guard_order = volume_config.enable_guard_order;
     let guard_price_offset = volume_config.guard_price_offset;
     let guard_quantity_percent = volume_config.guard_quantity_percent;
@@ -2025,7 +2040,7 @@ async fn create_volume(
         initial_direction
     );
     println!("  目标成交金额: {:.2} USDT", actual_value);
-    println!("  价格偏移: {:.8}", price_offset);
+    println!("  定价方式: 中位价 (Mid Price)");
     println!("  防套利阻挡单: {}", if enable_guard_order { "启用" } else { "禁用" });
     if enable_guard_order {
         println!("    - 阻挡单价格偏移: {:.8}", guard_price_offset);
@@ -2289,8 +2304,9 @@ async fn create_volume(
             println!("{}", "═".repeat(60));
         }
 
-        // 内层循环：执行repeat次
-        for round in 1..=repeat {
+        // 内层循环：执行repeat次（使用while循环，失败时不递增round，实现重试）
+        let mut round = 1u32;
+        while round <= repeat {
             if repeat > 1 {
                 println!("\n{}", "─".repeat(40));
                 println!("📊 第 {}/{} 次执行", round, repeat);
@@ -2312,7 +2328,9 @@ async fn create_volume(
             };
 
             if order_book.bids.is_empty() || order_book.asks.is_empty() {
-                println!("  ❌ Order book is empty，跳过本轮");
+                println!("  ❌ Order book is empty");
+                println!("\n🔄 等待 1 秒后重试第 {}/{} 次执行...", round, repeat);
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 continue;
             }
 
@@ -2322,12 +2340,10 @@ async fn create_volume(
             println!("  Best Bid: {:.6}", best_bid);
             println!("  Best Ask: {:.6}", best_ask);
 
-            // 重新计算对敲价格
-            let trade_price = if current_direction == "buy" {
-                best_ask - price_offset
-            } else {
-                best_bid + price_offset
-            };
+            // 重新计算对敲价格（使用中位价）
+            let mid_price = (best_bid + best_ask) / 2.0;
+            println!("  Mid Price: {:.6}", mid_price);
+            let trade_price = mid_price;
 
             let trade_price = if trade_price < best_bid {
                 best_bid
@@ -2447,6 +2463,14 @@ async fn create_volume(
 
                 // 检查maker单是否是最低卖价（best ask）且没有同价位的其他单
                 println!("\n🔍 检查maker单是否为最优价...");
+
+                // 查询我们的 maker 订单，获取交易所返回的准确价格字符串
+                let maker_order_info = client1.get_order(&symbol, &maker.order_id).await.ok();
+                let maker_price_str = maker_order_info.as_ref().map(|o| o.price.as_str()).unwrap_or("");
+                let maker_qty: f64 = maker_order_info.as_ref()
+                    .and_then(|o| o.orig_qty.parse().ok())
+                    .unwrap_or(quantity);
+
                 let check_order_book = match client1.get_order_book(&symbol, Some(5)).await {
                     Ok(ob) => ob,
                     Err(e) => {
@@ -2456,26 +2480,67 @@ async fn create_volume(
                     }
                 };
 
-                if !check_order_book.asks.is_empty() {
-                    let current_best_ask: f64 = check_order_book.asks[0][0].parse().unwrap_or(0.0);
+                if !check_order_book.asks.is_empty() && !maker_price_str.is_empty() {
+                    let best_ask_price_str = &check_order_book.asks[0][0];
                     let best_ask_qty: f64 = check_order_book.asks[0][1].parse().unwrap_or(0.0);
-                    println!("  当前最低卖价: {:.6}，数量: {:.6}", current_best_ask, best_ask_qty);
-                    println!("  Maker卖单价格: {:.6}，数量: {:.6}", trade_price, quantity);
+                    println!("  当前最低卖价: {}，数量: {:.6}", best_ask_price_str, best_ask_qty);
+                    println!("  Maker卖单价格: {}，数量: {:.6} (订单ID: {})", maker_price_str, maker_qty, maker.order_id);
 
-                    let price_diff = (trade_price - current_best_ask).abs();
-                    let need_retry = if price_diff > 0.0000001 && trade_price > current_best_ask {
-                        // 有更低价格的卖单
-                        println!("  ❌ Maker卖单不是最低卖价！有其他卖单价格更低");
-                        true
-                    } else if price_diff <= 0.0000001 && best_ask_qty > quantity * 1.01 {
-                        // 价格相同，但该价位总数量大于我们的订单，说明有其他单排在前面
-                        println!("  ❌ 同价位有其他卖单！(订单簿数量 {:.6} > 我们的 {:.6})", best_ask_qty, quantity);
-                        true
+                    // 直接用字符串比较价格，避免浮点精度问题
+                    let need_retry = if maker_price_str == best_ask_price_str {
+                        // 价格完全相同，检查是否有其他同价订单
+                        if best_ask_qty > maker_qty * 1.01 {
+                            println!("  ❌ 同价位有其他卖单！(订单簿数量 {:.6} > 我们的 {:.6})", best_ask_qty, maker_qty);
+                            true
+                        } else {
+                            println!("  ✅ Maker卖单是最优价");
+                            false
+                        }
                     } else {
-                        false
+                        // 价格不同，比较大小
+                        let maker_price_f64: f64 = maker_price_str.parse().unwrap_or(0.0);
+                        let best_ask_f64: f64 = best_ask_price_str.parse().unwrap_or(0.0);
+                        if maker_price_f64 > best_ask_f64 {
+                            println!("  ❌ Maker卖单不是最低卖价！有其他卖单价格更低");
+                            println!("  📋 阻挡的卖单:");
+                            for (i, ask) in check_order_book.asks.iter().enumerate() {
+                                let ask_price_str = &ask[0];
+                                let ask_price: f64 = ask_price_str.parse().unwrap_or(0.0);
+                                let ask_qty: f64 = ask[1].parse().unwrap_or(0.0);
+                                if ask_price < maker_price_f64 {
+                                    println!("      #{}: 价格 {}, 数量 {:.6}", i + 1, ask_price_str, ask_qty);
+                                } else {
+                                    break;
+                                }
+                            }
+                            true
+                        } else {
+                            println!("  ✅ Maker卖单是最优价");
+                            false
+                        }
                     };
 
                     if need_retry {
+                        // 检查阻挡买单状态，诊断为什么没有阻挡住
+                        if let Some(ref gid) = guard_id {
+                            match client1.get_order(&symbol, gid).await {
+                                Ok(guard_order) => {
+                                    let executed: f64 = guard_order.executed_qty.parse().unwrap_or(0.0);
+                                    let orig_qty: f64 = guard_order.orig_qty.parse().unwrap_or(0.0);
+                                    if executed > 0.0 {
+                                        println!("  📊 阻挡买单状态: {} (成交 {:.6} / {:.6})", guard_order.status, executed, orig_qty);
+                                        println!("      → 阻挡单被其他卖单吃掉了，更低价的卖单是之后挂出的");
+                                    } else {
+                                        println!("  📊 阻挡买单状态: {} (未成交)", guard_order.status);
+                                        println!("      → 更低价的卖单可能使用了POST_ONLY，或在阻挡单之前就存在");
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("  ⚠️  查询阻挡买单状态失败: {}", e);
+                                }
+                            }
+                        }
+
                         println!("  🔄 撤单并重新计算价格...");
                         // 撤销maker单
                         if let Err(cancel_err) = client1.cancel_order(&symbol, &maker.order_id).await {
@@ -2491,7 +2556,8 @@ async fn create_volume(
                                 println!("  ✅ 阻挡单已撤销");
                             }
                         }
-                        // 短暂等待后重试
+                        // 短暂等待后重试当前执行
+                        println!("\n🔄 等待 1 秒后重试第 {}/{} 次执行...", round, repeat);
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
@@ -2534,10 +2600,9 @@ async fn create_volume(
                                 println!("  ✅ 阻挡单已取消");
                             }
                         }
-                        if round < repeat {
-                            println!("\n⏳ 等待 {} 秒后进行下一轮...", interval);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
-                        }
+                        // 失败后等待1秒重试当前执行
+                        println!("\n🔄 等待 1 秒后重试第 {}/{} 次执行...", round, repeat);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
                 }
@@ -2643,6 +2708,14 @@ async fn create_volume(
 
                 // 检查maker单是否是最高买价（best bid）且没有同价位的其他单
                 println!("\n🔍 检查maker单是否为最优价...");
+
+                // 查询我们的 maker 订单，获取交易所返回的准确价格字符串
+                let maker_order_info = client1.get_order(&symbol, &maker.order_id).await.ok();
+                let maker_price_str = maker_order_info.as_ref().map(|o| o.price.as_str()).unwrap_or("");
+                let maker_qty: f64 = maker_order_info.as_ref()
+                    .and_then(|o| o.orig_qty.parse().ok())
+                    .unwrap_or(quantity);
+
                 let check_order_book = match client1.get_order_book(&symbol, Some(5)).await {
                     Ok(ob) => ob,
                     Err(e) => {
@@ -2652,26 +2725,56 @@ async fn create_volume(
                     }
                 };
 
-                if !check_order_book.bids.is_empty() {
-                    let current_best_bid: f64 = check_order_book.bids[0][0].parse().unwrap_or(0.0);
+                if !check_order_book.bids.is_empty() && !maker_price_str.is_empty() {
+                    let best_bid_price_str = &check_order_book.bids[0][0];
                     let best_bid_qty: f64 = check_order_book.bids[0][1].parse().unwrap_or(0.0);
-                    println!("  当前最高买价: {:.6}，数量: {:.6}", current_best_bid, best_bid_qty);
-                    println!("  Maker买单价格: {:.6}，数量: {:.6}", trade_price, quantity);
+                    println!("  当前最高买价: {}，数量: {:.6}", best_bid_price_str, best_bid_qty);
+                    println!("  Maker买单价格: {}，数量: {:.6} (订单ID: {})", maker_price_str, maker_qty, maker.order_id);
 
-                    let price_diff = (trade_price - current_best_bid).abs();
-                    let need_retry = if price_diff > 0.0000001 && trade_price < current_best_bid {
-                        // 有更高价格的买单
-                        println!("  ❌ Maker买单不是最高买价！有其他买单价格更高");
-                        true
-                    } else if price_diff <= 0.0000001 && best_bid_qty > quantity * 1.01 {
-                        // 价格相同，但该价位总数量大于我们的订单，说明有其他单排在前面
-                        println!("  ❌ 同价位有其他买单！(订单簿数量 {:.6} > 我们的 {:.6})", best_bid_qty, quantity);
-                        true
+                    // 直接用字符串比较价格，避免浮点精度问题
+                    let need_retry = if maker_price_str == best_bid_price_str {
+                        // 价格完全相同，检查是否有其他同价订单
+                        if best_bid_qty > maker_qty * 1.01 {
+                            println!("  ❌ 同价位有其他买单！(订单簿数量 {:.6} > 我们的 {:.6})", best_bid_qty, maker_qty);
+                            true
+                        } else {
+                            println!("  ✅ Maker买单是最优价");
+                            false
+                        }
                     } else {
-                        false
+                        // 价格不同，比较大小
+                        let maker_price_f64: f64 = maker_price_str.parse().unwrap_or(0.0);
+                        let best_bid_f64: f64 = best_bid_price_str.parse().unwrap_or(0.0);
+                        if maker_price_f64 < best_bid_f64 {
+                            println!("  ❌ Maker买单不是最高买价！有其他买单价格更高");
+                            true
+                        } else {
+                            println!("  ✅ Maker买单是最优价");
+                            false
+                        }
                     };
 
                     if need_retry {
+                        // 检查阻挡卖单状态，诊断为什么没有阻挡住
+                        if let Some(ref gid) = guard_id {
+                            match client1.get_order(&symbol, gid).await {
+                                Ok(guard_order) => {
+                                    let executed: f64 = guard_order.executed_qty.parse().unwrap_or(0.0);
+                                    let orig_qty: f64 = guard_order.orig_qty.parse().unwrap_or(0.0);
+                                    if executed > 0.0 {
+                                        println!("  📊 阻挡卖单状态: {} (成交 {:.6} / {:.6})", guard_order.status, executed, orig_qty);
+                                        println!("      → 阻挡单被其他买单吃掉了，更高价的买单是之后挂出的");
+                                    } else {
+                                        println!("  📊 阻挡卖单状态: {} (未成交)", guard_order.status);
+                                        println!("      → 更高价的买单可能使用了POST_ONLY，或在阻挡单之前就存在");
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("  ⚠️  查询阻挡卖单状态失败: {}", e);
+                                }
+                            }
+                        }
+
                         println!("  🔄 撤单并重新计算价格...");
                         // 撤销maker单
                         if let Err(cancel_err) = client1.cancel_order(&symbol, &maker.order_id).await {
@@ -2687,7 +2790,8 @@ async fn create_volume(
                                 println!("  ✅ 阻挡单已撤销");
                             }
                         }
-                        // 短暂等待后重试
+                        // 短暂等待后重试当前执行
+                        println!("\n🔄 等待 1 秒后重试第 {}/{} 次执行...", round, repeat);
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
@@ -2730,10 +2834,9 @@ async fn create_volume(
                                 println!("  ✅ 阻挡单已取消");
                             }
                         }
-                        if round < repeat {
-                            println!("\n⏳ 等待 {} 秒后进行下一轮...", interval);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
-                        }
+                        // 失败后等待1秒重试当前执行
+                        println!("\n🔄 等待 1 秒后重试第 {}/{} 次执行...", round, repeat);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
                 }
@@ -2942,9 +3045,12 @@ async fn create_volume(
             prev_total_base = curr_total_base;
             prev_total_quote = curr_total_quote;
 
+            // 本次执行成功，递增round
+            round += 1;
+
             // 如果还有下一轮，等待间隔时间
-            if round < repeat {
-                println!("\n⏳ 等待 {} 秒后进行第 {}/{} 次...", interval, round + 1, repeat);
+            if round <= repeat {
+                println!("\n⏳ 等待 {} 秒后进行第 {}/{} 次...", interval, round, repeat);
                 tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
             }
         } // 内层循环结束

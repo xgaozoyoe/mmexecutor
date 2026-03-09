@@ -82,9 +82,9 @@ fn default_enable_guard_order() -> bool {
     true  // 默认启用阻挡单
 }
 
-/// 刷量配置
+/// 单个交易所的刷量配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VolumeConfig {
+pub struct ExchangeVolumeConfig {
     pub exchange: String,  // 交易所名称: "mexc", "gate", "kucoin"
     pub account1: VolumeAccountConfig,  // 第一个账户 (maker)
     pub account2: VolumeAccountConfig,  // 第二个账户 (taker)
@@ -98,6 +98,52 @@ pub struct VolumeConfig {
     pub guard_price_offset: f64,  // 阻挡单相对于maker单的价格偏移
     #[serde(default = "default_guard_quantity_percent")]
     pub guard_quantity_percent: f64,  // 阻挡单数量百分比（相对于maker单的百分比）
+}
+
+/// 刷量配置包装器 - 支持单个交易所或多个交易所配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum VolumeConfigWrapper {
+    /// 多个交易所配置（新格式）
+    Multiple(Vec<ExchangeVolumeConfig>),
+    /// 单个交易所配置（旧格式，向后兼容）
+    Single(ExchangeVolumeConfig),
+}
+
+impl VolumeConfigWrapper {
+    /// 获取指定交易所的配置，如果不指定则返回第一个
+    pub fn get_exchange_config(&self, exchange: Option<&str>) -> Option<&ExchangeVolumeConfig> {
+        match self {
+            VolumeConfigWrapper::Single(config) => {
+                if let Some(ex) = exchange {
+                    if config.exchange.to_lowercase() == ex.to_lowercase() {
+                        Some(config)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(config)
+                }
+            }
+            VolumeConfigWrapper::Multiple(configs) => {
+                if let Some(ex) = exchange {
+                    configs.iter().find(|c| c.exchange.to_lowercase() == ex.to_lowercase())
+                } else {
+                    configs.first()
+                }
+            }
+        }
+    }
+
+    /// 获取所有可用的交易所名称
+    pub fn available_exchanges(&self) -> Vec<&str> {
+        match self {
+            VolumeConfigWrapper::Single(config) => vec![&config.exchange],
+            VolumeConfigWrapper::Multiple(configs) => {
+                configs.iter().map(|c| c.exchange.as_str()).collect()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,10 +213,12 @@ pub struct Config {
     pub orderbook_depth: u32,                   // 获取的订单簿深度
     #[serde(default = "default_volume_threshold")]
     pub volume_threshold_usdt: f64,             // VolumeThreshold 方法的默认阈值（USDT）
-
-    // 刷量配置（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume: Option<VolumeConfig>,
+    pub fix_mid_price: Option<f64>,             // 固定中间价，如果设置则直接使用此价格
+
+    // 刷量配置（可选）- 支持单个或多个交易所
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<VolumeConfigWrapper>,
 }
 
 impl Config {
@@ -305,6 +353,7 @@ impl Config {
             mid_price_method_ask: MidPriceMethod::Simple,           // Ask 直接取最优卖价
             orderbook_depth: 20,         // 获取20档订单簿
             volume_threshold_usdt: 100.0, // 当没有成交历史时使用的默认阈值
+            fix_mid_price: None,         // 固定中间价（可选，设置后直接使用此价格作为中间价）
             volume: None,  // 刷量配置（可选，使用 create-volume 命令时需要配置）
         };
 
@@ -362,6 +411,7 @@ impl Config {
             mid_price_method_ask: MidPriceMethod::Simple,
             orderbook_depth: 20,
             volume_threshold_usdt: 100.0,
+            fix_mid_price: None,  // 固定中间价（可选）
             volume: None,
         };
 

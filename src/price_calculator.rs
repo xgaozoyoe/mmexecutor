@@ -5,13 +5,18 @@ use crate::exchange::{OrderBook, OpenOrder};
 pub struct PriceCalculator;
 
 impl PriceCalculator {
+    /// 固定价格与计算价格的最大允许偏差百分比
+    const MAX_FIXED_PRICE_DEVIATION_PERCENT: f64 = 10.0;
+
     /// 根据方法分别计算 bid 和 ask 价格，然后取中间价
+    /// 如果设置了 fix_price，则直接使用固定价格作为中间价（但会验证偏差）
     pub fn calculate_mid_price(
         order_book: &OrderBook,
         bid_method: &MidPriceMethod,
         ask_method: &MidPriceMethod,
         all_orders: Option<&[OpenOrder]>,
         default_threshold: f64,
+        fix_price: Option<f64>,
     ) -> Result<MidPriceResult> {
         if order_book.bids.is_empty() || order_book.asks.is_empty() {
             anyhow::bail!("Order book is empty");
@@ -20,11 +25,36 @@ impl PriceCalculator {
         // 分别计算 bid 和 ask 价格
         let (bid_price, bid_details) = Self::calculate_bid_price(order_book, bid_method, all_orders, default_threshold)?;
         let (ask_price, ask_details) = Self::calculate_ask_price(order_book, ask_method)?;
+        let calculated_mid_price = (bid_price + ask_price) / 2.0;
 
-        let mid_price = (bid_price + ask_price) / 2.0;
+        // 如果设置了固定中间价，验证偏差后使用
+        if let Some(fixed_price) = fix_price {
+            let deviation_percent = ((fixed_price - calculated_mid_price) / calculated_mid_price * 100.0).abs();
+
+            if deviation_percent > Self::MAX_FIXED_PRICE_DEVIATION_PERCENT {
+                anyhow::bail!(
+                    "Fixed mid price {:.6} deviates {:.2}% from calculated mid price {:.6}, exceeds maximum allowed deviation of {:.1}%. Aborting for safety.",
+                    fixed_price,
+                    deviation_percent,
+                    calculated_mid_price,
+                    Self::MAX_FIXED_PRICE_DEVIATION_PERCENT
+                );
+            }
+
+            return Ok(MidPriceResult {
+                mid_price: fixed_price,
+                bid_price: fixed_price,
+                ask_price: fixed_price,
+                method_description: "Fixed price".to_string(),
+                details: format!(
+                    "  Using fixed mid price: {:.6} (calculated: {:.6}, deviation: {:.2}%)\n{}\n{}",
+                    fixed_price, calculated_mid_price, deviation_percent, bid_details, ask_details
+                ),
+            });
+        }
 
         Ok(MidPriceResult {
-            mid_price,
+            mid_price: calculated_mid_price,
             bid_price,
             ask_price,
             method_description: format!(
